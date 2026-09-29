@@ -1,0 +1,50 @@
+body{
+    background-color: #cacaca;
+    font-family:'Lucida Sans', 'Lucida Sans Regular', 'Lucida Grande', 'Lucida Sans Unicode', Geneva, Verdana, sans-serif;
+}
+
+
+@media screen and (min-width:450px) and (max-width:750px) {
+    .main-body{
+        width: 50vw;
+        background-color: white;
+    }
+    .logo{
+        width: 5rem;
+    }
+}
+
+@media screen and (min-width:751px) and (max-width:1550px){
+    .main-body{
+        width: 50vw;
+        background-color: white;
+    }
+    .logo{
+        width: 30%;
+    }
+}
+
+@media screen and (min-width:1551px) {
+    .main-body{
+        width: 30vw;
+        background-color: white;
+    }
+    .logo{
+        width: 40%;
+    }
+}
+
+@media screen and (max-width:449px) {
+    .main-body{
+        width: 90vw;
+        background-color: white;
+    }
+    .logo{
+        width: 40%;
+    }
+}
+
+.wel{
+    background-color: #d28eff;
+    color: white;
+}

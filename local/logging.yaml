@@ -1,0 +1,71 @@
+version: 1  # Defines logging config version
+disable_existing_loggers: False  # Allow existing loggers to continue
+
+# Define log format
+formatters:
+  detailed:
+    format: "%(asctime)s - %(levelname)s - %(message)s"
+
+# Define log handlers
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: detailed
+    stream: ext://sys.stdout
+
+  access_file:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: INFO
+    formatter: detailed
+    filename: wetraders_logs/access.log
+    when: midnight  # Rotate daily
+    interval: 1
+    backupCount: 7
+
+  error_file:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: ERROR
+    formatter: detailed
+    filename: wetraders_logs/error.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+
+  out_file:
+    class: logging.handlers.TimedRotatingFileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: wetraders_logs/out.log
+    when: midnight
+    interval: 1
+    backupCount: 7
+
+# Define loggers
+loggers:
+  access:
+    level: INFO
+    handlers: [access_file]
+    propagate: no
+
+  error:
+    level: ERROR
+    handlers: [error_file,out_file]
+    propagate: no
+
+  out:
+    level: DEBUG
+    handlers: [out_file]
+    propagate: no
+
+  performence:
+    level: DEBUG
+    handlers: [console,out_file]
+    propagate: no
+
+# Define root logger (default logger)
+root:
+  level: DEBUG
+  handlers: [console]
+
+

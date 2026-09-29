@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Secrets - never commit. Use .env.example files for the variable names.
+.env
+*.env
+!.env.example
+local/*.env
+
+# Logs and local data
+*.log
+local/wetraders_logs/
