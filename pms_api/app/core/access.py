@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, aliased
 from app.core import roles
 from app.core.security import Principal, get_current_principal
 from app.db.session import get_db
-from app.models.access import UserRole
+from app.models.access import RolePermission, UserRole
 from app.models.projects import Project
 from app.models.team import ProjectMember
 
@@ -28,6 +28,7 @@ INTERNAL = "internal"  # every signed-in user except a Client
 ROUTE_POLICY = {
     # who am I / role list
     ("GET", "/me"): ANY,
+    ("POST", "/auth/change-password"): ANY,
     ("GET", "/meta/roles"): ANY,
     # projects
     ("GET", "/projects/meta"): ("projects", "view"),
@@ -191,6 +192,8 @@ ROUTE_POLICY = {
     ("POST", "/settings/holidays"): ("settings", "edit"),
     ("DELETE", "/settings/holidays/{holiday_id}"): ("settings", "edit"),
     ("GET", "/settings/users"): ("settings", "view"),
+    ("GET", "/settings/permissions"): ("settings", "view"),
+    ("PUT", "/settings/permissions"): ("settings", "edit"),
     ("POST", "/settings/users"): ("settings", "edit"),
     ("PUT", "/settings/users/{role_id}"): ("settings", "edit"),
     ("DELETE", "/settings/users/{role_id}"): ("settings", "edit"),
@@ -235,13 +238,28 @@ def resolve_role(db: Session, principal: Principal) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your PMS access is switched off. Ask your PMS Admin.")
     principal.role_key = row.role if row is not None and row.role in roles.ROLE_KEYS else roles.MEMBER
     principal.role_title = roles.ROLE_TITLES[principal.role_key]
+    # The company's own matrix (Settings > Roles & Permissions) for this role.
+    principal.permissions = company_matrix(db, principal.client_id)[principal.role_key]
     principal.customer_name = row.customer_name if row is not None else None
     principal.role_row_id = row.id if row is not None else None
 
 
+def company_matrix(db: Session, client_id: int) -> dict:
+    rows = db.query(RolePermission).filter(RolePermission.client_id == client_id).all()
+    return roles.effective_matrix({(r.role, r.module_group): [a for a in r.actions.split(",") if a] for r in rows})
+
+
+def allowed(principal: Principal, group: str, action: str = "view") -> bool:
+    """The caller's right on a module, from the company's matrix (default matrix for internal callers)."""
+    perms = getattr(principal, "permissions", None)
+    if perms is None:
+        return roles.can(getattr(principal, "role_key", None), group, action)
+    return action in perms.get(group, [])
+
+
 def check(principal: Principal, group: str, action: str, what: str = None) -> None:
     """Refuses with a clear message when the caller's role lacks the action."""
-    if not roles.can(principal.role_key, group, action):
+    if not allowed(principal, group, action):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Your role ({principal.role_title}) cannot {what or f'{action} {group}'}",
@@ -319,4 +337,4 @@ def visible_project_ids(db: Session, principal: Principal):
 
 def can_see_rates(principal: Principal) -> bool:
     role = getattr(principal, "role_key", None)
-    return role is None or roles.can(role, "budget", "view")
+    return role is None or allowed(principal, "budget", "view")

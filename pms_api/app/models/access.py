@@ -21,9 +21,30 @@ class UserRole(Base):
     role = Column(Unicode(40), nullable=False)
     customer_name = Column(Unicode(200), nullable=True)
     is_active = Column(Boolean, nullable=False, server_default="1")
+    # The PMS's own login (app/api/routes/auth.py): a salted hash, never the password itself.
+    password_hash = Column(Unicode(200), nullable=True)
+    last_login_at = Column(DateTime, nullable=True)
     created_by = Column(Integer, nullable=True)
     updated_by = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class RolePermission(Base):
+    """A company's own setting for one role on one module (Settings > Roles & Permissions).
+
+    Without a row the recommended default (app/core/roles.py ROLE_MATRIX) applies; "actions" is the full list
+    for that role and module, comma-separated (empty = no access)."""
+
+    __tablename__ = "role_permissions"
+    __table_args__ = (UniqueConstraint("client_id", "role", "module_group", name="uq_role_permissions"), {"schema": SCHEMA})
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    client_id = Column(Integer, nullable=False, index=True)
+    role = Column(Unicode(40), nullable=False)
+    module_group = Column(Unicode(40), nullable=False)
+    actions = Column(Unicode(100), nullable=False, server_default="")
+    updated_by = Column(Integer, nullable=True)
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
 

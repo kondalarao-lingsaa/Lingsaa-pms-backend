@@ -20,7 +20,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core import roles
-from app.core.access import project_scope
+from app.core.access import allowed, project_scope
 from app.models.access import ApprovalLog
 from app.models.expenses import Expense
 from app.models.milestones import Milestone
@@ -331,7 +331,6 @@ def managed_project_ids(db, principal):
 
 def inbox(db: Session, principal) -> dict:
     """Everything waiting for this person's decision, newest first, with the counts per kind."""
-    role = principal.role_key
     uid = principal.user_id or -1
     items = []
     scope = project_scope(db, principal)
@@ -343,7 +342,7 @@ def inbox(db: Session, principal) -> dict:
         )
         return q if managed is None else q.filter(Project.id.in_(managed))
 
-    if roles.can(role, "projects", "approve"):
+    if allowed(principal, "projects", "approve"):
         pending = db.query(Project).filter(Project.client_id == principal.client_id, Project.is_deleted == False, scope,  # noqa: E712
                                            Project.status == "Pending Approval").all()
         lim = limits(db, principal.client_id)
@@ -353,7 +352,7 @@ def inbox(db: Session, principal) -> dict:
                               "detail": f"Level {p.approval_level or 1} of {p.approval_levels or 1}. {rule_text(p, lim)}", "amount": float(p.budget or 0),
                               "requested_by": p.submitted_by_name, "requested_at": utc_iso(p.submitted_at), "link": f"projects/projectDetails/?id={p.id}"})
 
-    if roles.can(role, "risks", "approve"):
+    if allowed(principal, "risks", "approve"):
         for c, p in projects_q(ChangeRequest).filter(ChangeRequest.is_deleted == False, ChangeRequest.status == "Submitted",  # noqa: E712
                                                        ChangeRequest.raised_by != uid):
             try:
@@ -365,7 +364,7 @@ def inbox(db: Session, principal) -> dict:
                           "amount": float(c.cost_impact or 0), "requested_by": c.raised_by_name, "requested_at": utc_iso(c.created_at),
                           "link": f"projects/projectDetails/?id={p.id}&tab=risks"})
 
-    if roles.can(role, "expenses", "approve"):
+    if allowed(principal, "expenses", "approve"):
         rows = db.query(Expense, Project).join(Project, Project.id == Expense.project_id).filter(
             Expense.client_id == principal.client_id, Project.is_deleted == False, scope, Expense.is_deleted == False,  # noqa: E712
             Expense.status == "Submitted", Expense.spent_by != uid)
@@ -378,7 +377,7 @@ def inbox(db: Session, principal) -> dict:
                           "detail": e.description, "amount": float(e.amount or 0), "requested_by": e.spent_by_name,
                           "requested_at": utc_iso(e.created_at), "link": "budget/expenses/"})
 
-    if roles.can(role, "timesheets", "approve"):
+    if allowed(principal, "timesheets", "approve"):
         live_task = db.query(Task.id).filter(Task.is_deleted == False)  # noqa: E712
         q = projects_q(TimeEntry).filter(TimeEntry.is_deleted == False, TimeEntry.status == "Submitted", TimeEntry.user_id != uid,  # noqa: E712
                                           TimeEntry.task_id.in_(live_task))
@@ -394,7 +393,7 @@ def inbox(db: Session, principal) -> dict:
             w["amount"] = None
             items.append(w)
 
-    if roles.can(role, "deliverables", "approve"):
+    if allowed(principal, "deliverables", "approve"):
         for m, p in projects_q(Milestone).filter(Milestone.is_deleted == False, Milestone.status == "Ready for Review"):  # noqa: E712
             items.append({"kind": "milestone", "id": m.id, "project_id": p.id, "project_code": p.project_code, "title": m.name,
                           "detail": "Ready for review: the client accepts it in the portal, or you accept it for them",

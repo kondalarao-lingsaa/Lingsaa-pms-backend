@@ -26,6 +26,7 @@ class Principal:
         self.role_title = None
         self.customer_name = None
         self.role_row_id = None
+        self.permissions = None
 
 
 def decode_token(token: str) -> dict:

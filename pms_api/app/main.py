@@ -15,7 +15,7 @@ from app.api.routes import billing, dashboard, documents, health, milestones, pl
 from app.api.routes import settings as company_settings
 from app.api.routes import expenses as expense_routes
 from app.api.routes import access as access_routes
-from app.api.routes import portal
+from app.api.routes import auth, portal
 from app.core.access import authorize
 from app.core.config import settings
 
@@ -115,6 +115,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 
 app.include_router(health.router, prefix="/api")
+app.include_router(auth.router, prefix="/api")  # login itself needs no login
 # Every other route needs a signed-in user whose role allows it (app/core/access.py).
-for router in (projects.router, tasks.router, team.router, timesheets.router, milestones.router, billing.router, risks.router, documents.router, planning.router, reports.router, sprints.router, dashboard.router, workload.router, communication.router, company_settings.router, expense_routes.router, access_routes.router, portal.router):
+for router in (projects.router, tasks.router, team.router, timesheets.router, milestones.router, billing.router, risks.router, documents.router, planning.router, reports.router, sprints.router, dashboard.router, workload.router, communication.router, company_settings.router, expense_routes.router, access_routes.router, portal.router, auth.account_router):
     app.include_router(router, prefix="/api", dependencies=[Depends(authorize)])

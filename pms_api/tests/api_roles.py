@@ -201,7 +201,26 @@ try:
     ok("Client cannot see their company's project while it is a Draft (404)", s == 404, s)
     s, r = call("member", "POST", f"/projects/{pid_mid}/milestones/{mid_ms}/status", {"status": "Accepted"})
     ok("Member cannot accept a milestone (403)", s == 403, s)
+
+    # 9. permission matrix (Settings > Roles & Permissions)
+    s, r = call("member", "GET", "/billing/invoices")
+    ok("By default a Member cannot open Billing", s == 403, s)
+    s, r = call("admin", "PUT", "/settings/permissions", {"role": "member", "permissions": {"billing": ["view"], "settings": ["view", "edit"]}})
+    ok("Admin gives Members Billing (view)", s == 200 and r["data"]["matrix"]["member"].get("billing") == ["view"], r)
+    ok("…but Settings stays Admin-only (locked)", "settings" not in r["data"]["matrix"]["member"], r["data"]["matrix"]["member"])
+    s, r = call("member", "GET", "/billing/invoices")
+    ok("The Member can now open Billing", s == 200, s)
+    s, me = call("member", "GET", "/me")
+    ok("/me shows the company's matrix", me["detail"]["permissions"].get("billing") == ["view"], me["detail"]["permissions"])
+    s, r = call("pm", "PUT", "/settings/permissions", {"role": "member", "permissions": {"billing": ["view", "add"]}})
+    ok("A Project Manager cannot change permissions (403)", s == 403, s)
+    s, r = call("admin", "PUT", "/settings/permissions", {"role": "admin", "permissions": {"billing": []}})
+    ok("Admin's own rights cannot be reduced", s == 422, s)
+    s, r = call("admin", "PUT", "/settings/permissions", {"role": "member", "permissions": None})
+    s2, _ = call("member", "GET", "/billing/invoices")
+    ok("Reset to recommended removes it again", s == 200 and s2 == 403, (s, s2))
 finally:
+    call("admin", "PUT", "/settings/permissions", {"role": "member", "permissions": None})
     for pid in created:
         call("admin", "DELETE", f"/projects/{pid}")
 

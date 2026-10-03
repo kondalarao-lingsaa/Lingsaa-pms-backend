@@ -45,6 +45,8 @@ ADDED_COLUMNS = [
     ("projectmanagement.projects", "baseline_end_date", "DATE"),
     ("projectmanagement.projects", "baseline_at", "DATETIME"),
     ("projectmanagement.milestones", "baseline_due_date", "DATE"),
+    ("projectmanagement.user_roles", "password_hash", "NVARCHAR(200)"),
+    ("projectmanagement.user_roles", "last_login_at", "DATETIME"),
 ]
 
 # Columns widened after they were created.

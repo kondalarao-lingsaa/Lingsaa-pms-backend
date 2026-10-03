@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # Local-dev shortcuts until the MASTER service's token secret and claim names are confirmed.
     JWT_ENFORCE_SIGNATURE: bool = False
     ALLOW_TENANT_FROM_QUERY: bool = True
+    # The PMS's own email + password login (until the MASTER login is connected) and how long a login lasts.
+    DEMO_LOGIN_ENABLED: bool = True
+    LOGIN_HOURS: int = 12
 
     CORS_ORIGINS: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001"
     MASTER_SERVICE_API_URL: str = "http://127.0.0.1:8009"

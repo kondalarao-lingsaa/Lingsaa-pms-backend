@@ -79,6 +79,77 @@ ROLE_MATRIX = {
     CLIENT: {"portal": ["view", "add", "approve"]},
 }
 
+# What each module covers, for Settings > Roles & Permissions.
+GROUP_INFO = {
+    "dashboard": ("Dashboard", "Company-wide health, workload and money at a glance"),
+    "approvals": ("My Approvals", "The inbox of requests waiting for this person"),
+    "projects": ("Projects", "Create and change projects, templates; approve = project approval (by Approval Rules)"),
+    "planning": ("Planning", "Gantt, roadmap and task links"),
+    "tasks": ("Tasks", "Tasks, board, backlog and calendar"),
+    "sprints": ("Sprints", "Sprint planning and boards"),
+    "resources": ("Team & Resources", "Who is on a team, allocation %, capacity and utilization"),
+    "timesheets": ("Timesheets", "Log hours (add/edit); approve = approve the team's hours"),
+    "budget": ("Budget & Costs", "Budgets, costs and pay rates (rates are hidden without this)"),
+    "expenses": ("Expenses", "Spend outside salaries; approve = approve expenses (by Approval Rules)"),
+    "deliverables": ("Milestones", "Milestones and deliverables; approve = accept for the client"),
+    "risks": ("Risks & Changes", "Risks, issues and change requests; approve = approve changes (by Approval Rules)"),
+    "documents": ("Documents", "Project files and versions"),
+    "communication": ("Communication", "Comments, mentions, activity and client messages"),
+    "billing": ("Billing", "Invoices; approve = issue invoices and record payments"),
+    "reports": ("Reports", "All reports and CSV downloads"),
+    "settings": ("Settings", "Company settings, users, roles and approval rules"),
+    "portal": ("Client Portal", "The client's own view of their projects"),
+}
+
+INTERNAL_GROUPS = [g for g in GROUPS if g != "portal"]
+
+
+def locked(role: str, group: str, action: str) -> str | None:
+    """Rules that keep the PMS safe whatever a company changes; None when the cell may be changed.
+
+    - Admin always has everything, so nobody can lock the company out.
+    - Settings (users, roles, approval rules) is Admin-only: nobody can give themselves more rights.
+    - A Client only ever has the client portal; inside the company nobody needs portal rights but the Admin.
+    - Project approval levels belong to Director and Admin (Settings > Approval Rules)."""
+    if role == ADMIN:
+        return "Admin always has full access"
+    if group == "settings":
+        return "Only the Admin manages settings, users and permissions"
+    if role == CLIENT and group != "portal":
+        return "A client only uses the client portal"
+    if group == "portal" and role != CLIENT:
+        return "The client portal is for client logins"
+    if group == "projects" and action == "approve" and role != DIRECTOR:
+        return "Project approval levels are Director and Admin (Approval Rules)"
+    if group == "projects" and action == "approve":
+        return "Directors approve projects (Approval Rules)"
+    if group == "approvals" and action != "view":
+        return "My Approvals is a list; decisions are made on each item"
+    return None
+
+
+def effective_matrix(overrides: dict) -> dict:
+    """The company's matrix: the recommended defaults, with its own changes on the cells that may change.
+    overrides: {(role, group): [actions]}."""
+    matrix = {}
+    for role in ROLE_KEYS:
+        rights = {}
+        for group in GROUPS:
+            default = list(ROLE_MATRIX.get(role, {}).get(group, []))
+            chosen = overrides.get((role, group))
+            if chosen is None:
+                actions = default
+            else:
+                # Locked cells always keep the default; the rest follow the company's choice.
+                actions = [a for a in ACTIONS if (a in default if locked(role, group, a) else a in chosen)]
+            if actions and "view" not in actions:
+                actions = ["view"] + actions  # any right on a module includes seeing it
+            if actions:
+                rights[group] = actions
+        matrix[role] = rights
+    return matrix
+
+
 # Roles that see every project of the company; the others see only their own (see access.project_scope).
 SEE_ALL_PROJECTS = {ADMIN, DIRECTOR, FINANCE, RESOURCE_MANAGER}
 
