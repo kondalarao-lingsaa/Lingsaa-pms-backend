@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Unicode, UniqueConstraint, func
 
 from app.db.base import Base
 
@@ -12,9 +12,9 @@ class DefaultRole(Base):
     __table_args__ = {"schema": SCHEMA}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    role_key = Column(String(50), nullable=False, unique=True)
-    title = Column(String(100), nullable=False)
-    responsibility = Column(String(255), nullable=True)
+    role_key = Column(Unicode(50), nullable=False, unique=True)
+    title = Column(Unicode(100), nullable=False)
+    responsibility = Column(Unicode(255), nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
@@ -29,5 +29,5 @@ class DefaultRolePermission(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     role_id = Column(Integer, ForeignKey(f"{SCHEMA}.default_roles.id"), nullable=False)
-    module_group = Column(String(50), nullable=False)
-    action = Column(String(20), nullable=False)
+    module_group = Column(Unicode(50), nullable=False)
+    action = Column(Unicode(20), nullable=False)

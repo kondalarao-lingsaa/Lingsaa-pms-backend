@@ -14,7 +14,22 @@ from sqlalchemy.orm import Session  # noqa: E402
 from app.core.roles import ROLE_MATRIX, ROLES  # noqa: E402
 from app.db.base import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402
+from app.models import projects as project_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import tasks as task_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import team as team_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import timesheets as timesheet_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import milestones as milestone_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import billing as billing_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import risks as risk_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import documents as document_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import sprints as sprint_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import notifications as notification_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import settings as settings_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import templates as template_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import expenses as expense_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import project_settings as project_settings_models  # noqa: E402,F401  (registers tables on Base)
 from app.models import roles as role_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import access as access_models  # noqa: E402,F401  (registers tables on Base)
 from app.models.roles import SCHEMA, DefaultRole, DefaultRolePermission  # noqa: E402
 
 
