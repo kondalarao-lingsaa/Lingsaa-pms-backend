@@ -62,9 +62,17 @@ def _num(v):
     return float(v) if v is not None else None
 
 
+def effective_rate(status, locked_rate, current_rate):
+    """The rate hours are costed at. Approved hours keep the rate locked when they were approved (none = unrated,
+    they cost 0 everywhere); hours not approved yet are priced at the member's current rate."""
+    if status == "Approved":
+        return locked_rate
+    return locked_rate if locked_rate is not None else current_rate
+
+
 def entry_out(e, *, task_key=None, task_title=None, project_code=None, project_name=None, rate=None) -> dict:
     hours = float(e.hours)
-    effective_rate = e.hourly_rate if e.hourly_rate is not None else rate
+    effective_rate_ = effective_rate(e.status, e.hourly_rate, rate)
     return {
         "id": e.id,
         "project_id": e.project_id,
@@ -80,8 +88,8 @@ def entry_out(e, *, task_key=None, task_title=None, project_code=None, project_n
         "hours": hours,
         "note": e.note,
         "status": e.status,
-        "hourly_rate": _num(effective_rate),
-        "cost": round(hours * float(effective_rate), 2) if effective_rate is not None else None,
+        "hourly_rate": _num(effective_rate_),
+        "cost": round(hours * float(effective_rate_), 2) if effective_rate_ is not None else None,
         "submitted_at": utc_iso(e.submitted_at),
         "reviewed_by_name": e.reviewed_by_name,
         "reviewed_at": utc_iso(e.reviewed_at),

@@ -39,6 +39,8 @@ ROUTE_POLICY = {
     ("PUT", "/projects/{project_id}"): ("projects", "edit"),
     # Submit is "edit"; Approve / Send back are checked again inside (approval rules).
     ("POST", "/projects/{project_id}/status"): ("projects", "edit"),
+    # Closed -> Active again (closed by mistake): Admin / Director only, with a reason.
+    ("POST", "/projects/{project_id}/reopen"): ("projects", "approve"),
     ("DELETE", "/projects/{project_id}"): ("projects", "delete"),
     ("GET", "/projects/{project_id}/approvals"): ("projects", "view"),
     # templates and project settings
@@ -128,7 +130,8 @@ ROUTE_POLICY = {
     ("POST", "/projects/{project_id}/milestones"): ("deliverables", "add"),
     ("PUT", "/projects/{project_id}/milestones/{milestone_id}"): ("deliverables", "edit"),
     ("DELETE", "/projects/{project_id}/milestones/{milestone_id}"): ("deliverables", "delete"),
-    ("POST", "/projects/{project_id}/milestones/{milestone_id}/status"): ("deliverables", "edit"),
+    # Accept / Request Changes need "approve", every other move "edit" (both checked inside the route).
+    ("POST", "/projects/{project_id}/milestones/{milestone_id}/status"): ("deliverables", "view"),
     ("POST", "/projects/{project_id}/milestones/{milestone_id}/deliverables"): ("deliverables", "add"),
     ("PUT", "/projects/{project_id}/milestones/{milestone_id}/deliverables/{deliverable_id}"): ("deliverables", "edit"),
     ("POST", "/projects/{project_id}/milestones/{milestone_id}/deliverables/{deliverable_id}/done"): ("deliverables", "edit"),
@@ -209,6 +212,16 @@ ROUTE_POLICY = {
     ("GET", "/portal/invoices/{invoice_id}"): ("portal", "view"),
     ("GET", "/projects/{project_id}/client-messages"): ("communication", "view"),
     ("POST", "/projects/{project_id}/client-messages"): ("communication", "add"),
+    # automation (Settings > Automation; Admin-only like the rest of Settings) and recurring tasks
+    ("GET", "/automation"): ("settings", "view"),
+    ("GET", "/automation/runs"): ("settings", "view"),
+    ("PUT", "/automation/{job_key}"): ("settings", "edit"),
+    ("POST", "/automation/{job_key}/run"): ("settings", "edit"),
+    ("GET", "/recurring-tasks"): ("tasks", "view"),
+    ("POST", "/recurring-tasks"): ("tasks", "add"),
+    ("PUT", "/recurring-tasks/{rule_id}"): ("tasks", "add"),
+    ("DELETE", "/recurring-tasks/{rule_id}"): ("tasks", "delete"),
+    ("GET", "/projects/{project_id}/assignee-suggestions"): ("tasks", "view"),
     # development-only test logins (the route itself is off in production)
     ("POST", "/dev/login-as"): ("settings", "edit"),
 }
@@ -333,6 +346,23 @@ def project_scope(db: Session, principal: Principal):
 def visible_project_ids(db: Session, principal: Principal):
     """Subquery of visible project ids, for queries that do not join Project."""
     return select(Project.id).where(Project.client_id == principal.client_id, Project.is_deleted == False, project_scope(db, principal))  # noqa: E712
+
+
+def runs_project(principal: Principal, project) -> bool:
+    """The project's own manager (or its creator while it has no manager), a Director or an Admin."""
+    role = getattr(principal, "role_key", None)
+    if role is None or role in (roles.ADMIN, roles.DIRECTOR):
+        return True
+    uid = principal.user_id
+    return bool(uid) and (project.project_manager_id == uid or (project.project_manager_id is None and project.created_by == uid))
+
+
+def require_runs_project(principal: Principal, project, what: str) -> None:
+    if not runs_project(principal, project):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Only {project.project_code}'s project manager ({project.project_manager_name or 'not set'}), a Director or an Admin can {what}",
+        )
 
 
 def can_see_rates(principal: Principal) -> bool:

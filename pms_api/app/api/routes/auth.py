@@ -1,15 +1,15 @@
 """The PMS's own login (email + password), used until the MASTER login is connected.
 
 - POST /api/auth/login: email + password of a user in Settings > Users & Roles -> a signed login token.
-  After 5 wrong passwords an email is locked for 10 minutes.
-- POST /api/auth/change-password: the signed-in person changes their own password.
+  After 5 wrong passwords an email is locked for 10 minutes from that address.
+- POST /api/auth/change-password: the signed-in person changes their own password (same 5-try limit).
 When the PMS moves to the MASTER login, set DEMO_LOGIN_ENABLED=false: the screens, roles and approvals stay the same.
 """
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from jose import jwt
 from pydantic import BaseModel, Field
 from sqlalchemy import func
@@ -28,7 +28,10 @@ account_router = APIRouter(prefix="/auth", tags=["auth"])
 
 MAX_FAILURES = 5
 LOCK_SECONDS = 600
-_failures = defaultdict(list)  # email -> times of recent wrong passwords (per server process)
+MAX_TRACKED = 10000  # keys kept at most, so trying endless different emails cannot grow memory without limit
+# Recent wrong passwords (per server process): "login|<address>|<email>" -> times, "password|<company>|<user>" -> times.
+# A login is locked per address + email, so a stranger elsewhere cannot keep someone else's account locked.
+_failures = defaultdict(list)
 
 
 class LoginIn(BaseModel):
@@ -36,10 +39,32 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=128)
 
 
-def _locked(email: str) -> bool:
+def _locked(key: str) -> bool:
     now = time.time()
-    _failures[email] = [t for t in _failures[email] if now - t < LOCK_SECONDS]
-    return len(_failures[email]) >= MAX_FAILURES
+    recent = [t for t in _failures.get(key, []) if now - t < LOCK_SECONDS]
+    if recent:
+        _failures[key] = recent
+    else:
+        _failures.pop(key, None)
+    return len(recent) >= MAX_FAILURES
+
+
+def _failed(key: str) -> int:
+    """Records a wrong password; returns how many tries are left."""
+    if len(_failures) >= MAX_TRACKED and key not in _failures:
+        now = time.time()
+        for old in [k for k, times in _failures.items() if not times or now - times[-1] >= LOCK_SECONDS]:
+            del _failures[old]
+        if len(_failures) >= MAX_TRACKED:
+            # Still full: forget the keys that failed longest ago.
+            for old in sorted(_failures, key=lambda k: _failures[k][-1])[: MAX_TRACKED // 10]:
+                del _failures[old]
+    _failures[key].append(time.time())
+    return MAX_FAILURES - len(_failures[key])
+
+
+def _client_address(request: Request) -> str:
+    return request.client.host if request.client else "-"
 
 
 def issue_token(row: UserRole) -> str:
@@ -49,20 +74,20 @@ def issue_token(row: UserRole) -> str:
 
 
 @router.post("/login")
-def login(body: LoginIn, db: Session = Depends(get_db)):
+def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     if not settings.DEMO_LOGIN_ENABLED:
         raise HTTPException(status_code=404, detail="Sign in through the Lingsaa login")
     email = body.email.strip().lower()
-    if _locked(email):
+    key = f"login|{_client_address(request)}|{email}"
+    if _locked(key):
         raise HTTPException(status_code=429, detail="Too many wrong passwords. Try again in 10 minutes")
     row = db.query(UserRole).filter(func.lower(UserRole.email) == email, UserRole.password_hash != None).first()  # noqa: E711
     if row is None or not verify_password(body.password, row.password_hash):
-        _failures[email].append(time.time())
-        left = MAX_FAILURES - len(_failures[email])
+        left = _failed(key)
         raise HTTPException(status_code=401, detail="Email or password is wrong" + (f". {left} tries left" if 0 < left <= 2 else ""))
     if not row.is_active:
         raise HTTPException(status_code=403, detail="Your PMS access is switched off. Ask your PMS Admin")
-    _failures.pop(email, None)
+    _failures.pop(key, None)
     row.last_login_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
     return {
@@ -81,9 +106,15 @@ class ChangePasswordIn(BaseModel):
 
 @account_router.post("/change-password")
 def change_password(body: ChangePasswordIn, db: Session = Depends(get_db), principal: Principal = Depends(get_current_principal)):
+    # The same limit as signing in, so a stolen session cannot be used to guess the password.
+    key = f"password|{principal.client_id}|{principal.user_id}"
+    if _locked(key):
+        raise HTTPException(status_code=429, detail="Too many wrong passwords. Try again in 10 minutes")
     row = db.query(UserRole).filter(UserRole.client_id == principal.client_id, UserRole.user_id == principal.user_id).one_or_none()
     if row is None or not verify_password(body.current_password, row.password_hash):
-        raise HTTPException(status_code=409, detail="Your current password is wrong")
+        left = _failed(key)
+        raise HTTPException(status_code=409, detail="Your current password is wrong" + (f". {left} tries left" if 0 < left <= 2 else ""))
+    _failures.pop(key, None)
     problem = password_problem(body.new_password)
     if problem:
         raise HTTPException(status_code=422, detail=problem)

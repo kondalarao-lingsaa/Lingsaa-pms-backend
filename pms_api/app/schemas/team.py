@@ -12,8 +12,11 @@ class MemberIn(BaseModel):
     user_id: Optional[int] = None
     email: Optional[str] = Field(default=None, max_length=150)
     role: str
-    allocation_pct: int = Field(ge=1, le=100)
+    # 0 = on the team but not planned yet (the project manager joins every team that way).
+    allocation_pct: int = Field(ge=0, le=100)
     hourly_rate: Optional[Decimal] = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+    # Price per hour charged to the client (Time & Material); the hourly_rate above is the internal cost.
+    bill_rate: Optional[Decimal] = Field(default=None, ge=0, max_digits=10, decimal_places=2)
     start_date: Optional[date] = None
     end_date: Optional[date] = None
 
@@ -60,6 +63,7 @@ def member_out(m, stats=None) -> dict:
         "role": m.role,
         "allocation_pct": m.allocation_pct,
         "hourly_rate": float(m.hourly_rate) if m.hourly_rate is not None else None,
+        "bill_rate": float(m.bill_rate) if m.bill_rate is not None else None,
         "start_date": m.start_date.isoformat() if m.start_date else None,
         "end_date": m.end_date.isoformat() if m.end_date else None,
         "open_tasks": stats.get("open", 0),

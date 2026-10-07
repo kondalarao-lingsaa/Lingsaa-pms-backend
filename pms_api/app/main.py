@@ -9,13 +9,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError, SQLAlchemyError
 
 from app.api.routes import billing, dashboard, documents, health, milestones, planning, projects, reports, risks, sprints, tasks, team, timesheets, workload, communication
 from app.api.routes import settings as company_settings
 from app.api.routes import expenses as expense_routes
 from app.api.routes import access as access_routes
 from app.api.routes import auth, portal
+from app.api.routes import automation as automation_routes
+from app.core import scheduler
 from app.core.access import authorize
 from app.core.config import settings
 
@@ -32,7 +34,9 @@ async def lifespan(_app: FastAPI):
     logger.info("%s %s starting (environment=%s)", settings.APP_NAME, settings.APP_VERSION, settings.ENVIRONMENT)
     if not settings.JWT_ENFORCE_SIGNATURE or settings.ALLOW_TENANT_FROM_QUERY:
         logger.warning("Development auth shortcuts are ON (JWT signature not enforced / tenant from query). Never use in production.")
+    scheduler.start()
     yield
+    scheduler.stop()
 
 
 app = FastAPI(
@@ -95,6 +99,12 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 async def database_error_handler(request: Request, exc: SQLAlchemyError):
     request_id = getattr(request.state, "request_id", "-")
     logger.exception("Database error [%s]", request_id)
+    # A unique index refused a row (SQL Server 2601/2627): two people saved the same thing at the same moment.
+    if isinstance(exc, IntegrityError) and "duplicate key" in str(getattr(exc, "orig", exc)).lower():
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": "This was just saved by someone else (or twice). Refresh the page and check before trying again."},
+        )
     # Only a lost/refused connection means "database down"; anything else is a bug to report with its reference.
     if isinstance(exc, (OperationalError, InterfaceError)) or getattr(exc, "connection_invalidated", False):
         return JSONResponse(
@@ -117,5 +127,5 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 app.include_router(health.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")  # login itself needs no login
 # Every other route needs a signed-in user whose role allows it (app/core/access.py).
-for router in (projects.router, tasks.router, team.router, timesheets.router, milestones.router, billing.router, risks.router, documents.router, planning.router, reports.router, sprints.router, dashboard.router, workload.router, communication.router, company_settings.router, expense_routes.router, access_routes.router, portal.router, auth.account_router):
+for router in (projects.router, tasks.router, team.router, timesheets.router, milestones.router, billing.router, risks.router, documents.router, planning.router, reports.router, sprints.router, dashboard.router, workload.router, communication.router, company_settings.router, expense_routes.router, access_routes.router, portal.router, automation_routes.router, auth.account_router):
     app.include_router(router, prefix="/api", dependencies=[Depends(authorize)])

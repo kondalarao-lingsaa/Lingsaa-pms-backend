@@ -35,6 +35,8 @@ class ProjectMember(Base):
     role = Column(Unicode(50), nullable=False)
     allocation_pct = Column(Integer, nullable=False, server_default="0")
     hourly_rate = Column(Numeric(10, 2), nullable=True)
+    # What the client pays for an hour of this person (Time & Material invoices). Empty = billed at hourly_rate.
+    bill_rate = Column(Numeric(10, 2), nullable=True)
     start_date = Column(Date, nullable=True)
     end_date = Column(Date, nullable=True)
     created_by = Column(Integer, nullable=True)

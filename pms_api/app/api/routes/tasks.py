@@ -89,6 +89,8 @@ def update_task(task_id: int, body: TaskIn, db: Session = Depends(get_db), princ
     task = _found(db, principal, task_id)
     try:
         task = repo.update_task(db, principal, task, body.model_dump())
+    except repo.TaskConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except repo.TaskError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"detail": f"Task {task.task_key} updated successfully", "data": repo.row_for(db, principal, task.id)}
@@ -171,6 +173,8 @@ def remove_dependency(task_id: int, dependency_id: int, db: Session = Depends(ge
         collab.remove_dependency(db, principal, _found(db, principal, task_id), dependency_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except collab.CollabError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {"detail": "Dependency removed"}
 
 

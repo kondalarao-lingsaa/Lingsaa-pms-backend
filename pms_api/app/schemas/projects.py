@@ -5,7 +5,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.schemas.rules import EMAIL_REGEX, MOBILE_REGEX, capitalize_first, clean, gstin, pan, person_name, title_text, utc_iso
-from app.models.projects import PROJECT_PRIORITIES, PROJECT_STATUSES, PROJECT_TRANSITIONS
+from app.models.projects import PROJECT_PRIORITIES, PROJECT_STATUSES, PROJECT_TRANSITIONS, PROJECT_TYPES
 
 
 class ProjectIn(BaseModel):
@@ -74,6 +74,13 @@ class ProjectIn(BaseModel):
     def _description(cls, v):
         return capitalize_first(v)
 
+    @field_validator("project_type")
+    @classmethod
+    def _known_type(cls, v):
+        if v and v.strip() not in PROJECT_TYPES:
+            raise ValueError("Please Select Project Type")
+        return v.strip() if v else v
+
     @field_validator("project_type", "category", "business_domain")
     @classmethod
     def _lookup(cls, v):
@@ -120,6 +127,19 @@ def missing_for_approval(project) -> list[str]:
     return [label for field, label in APPROVAL_REQUIRED.items() if getattr(project, field) in (None, "")]
 
 
+class ReopenIn(BaseModel):
+    """Reopening a Closed project (Admin or Director) always says why; it is kept in the approval history."""
+    reason: str = Field(max_length=1000)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, v):
+        v = (v or "").strip()
+        if len(v) < 10:
+            raise ValueError("Please Enter the Reason for reopening (at least 10 characters)")
+        return capitalize_first(v)
+
+
 class StatusChange(BaseModel):
     status: str
     # Approve: optional note. Send back to Draft by an approver: the reason (required there).
@@ -157,6 +177,8 @@ def project_out(p) -> dict:
         "budget": float(p.budget) if p.budget is not None else None,
         "project_manager_id": p.project_manager_id,
         "project_manager_name": p.project_manager_name,
+        # Who runs a project without a manager login (access.runs_project): its creator.
+        "created_by": p.created_by,
         "submitted_by_name": p.submitted_by_name,
         "submitted_at": utc_iso(p.submitted_at),
         "approval_level": p.approval_level,

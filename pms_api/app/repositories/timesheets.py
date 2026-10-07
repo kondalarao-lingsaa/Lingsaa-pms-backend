@@ -3,9 +3,11 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.models.project_settings import DEFAULTS as SETTING_DEFAULTS, ProjectSettings
 from app.models.projects import Project
 from app.models.tasks import Task
 from app.models.team import ProjectMember
@@ -102,18 +104,26 @@ def my_week(db, principal, week_start: date) -> dict:
             .all()
         )
 
+    # Days before locked_before are closed by the project's lock-days setting (rejected hours stay fixable).
+    locked_before = {}
+    for pid in {t.project_id for t, *_ in task_rows}:
+        lock_days = project_settings_repo.get(db, pid)["timesheet_lock_days"]
+        locked_before[pid] = (date.today() - timedelta(days=lock_days)).isoformat() if lock_days else None
+
     def task_brief(t, code, name, status):
         member = member_by_project.get(t.project_id)
         mine = bool(member and ((t.assignee_id and t.assignee_id == principal.user_id) or (t.assignee_name or "").lower() == member.member_name.lower()))
         return {"task_id": t.id, "task_key": t.task_key, "title": t.title, "task_status": t.status, "project_id": t.project_id,
                 "project_code": code, "project_name": name, "project_status": status, "assigned_to_me": mine,
-                "can_log": status in LOGGABLE_PROJECT_STATUSES and t.project_id in member_by_project}
+                "can_log": status in LOGGABLE_PROJECT_STATUSES and t.project_id in member_by_project,
+                "locked_before": locked_before.get(t.project_id)}
 
     briefs = {t.id: task_brief(t, c, n, s) for t, c, n, s in task_rows}
     rows = {}
     for e in entries:
         row = rows.setdefault(e.task_id, {**briefs.get(e.task_id, {"task_id": e.task_id}), "cells": {}, "total": 0.0})
-        row["cells"][e.work_date.isoformat()] = {"id": e.id, "hours": float(e.hours), "status": e.status, "note": e.note, "reject_reason": e.reject_reason}
+        row["cells"][e.work_date.isoformat()] = {"id": e.id, "hours": float(e.hours), "status": e.status, "note": e.note, "reject_reason": e.reject_reason,
+                                                 "sent_back": _sent_back(e)}
         row["total"] += float(e.hours)
 
     day_totals = {d: 0.0 for d in days}
@@ -164,10 +174,10 @@ def save_entry(db, principal, data: dict):
         raise TimesheetError(f"{day.strftime('%d %b %Y')} is outside your time on {project.project_code}")
     if project.start_date and day < project.start_date:
         raise TimesheetError(f"{project.project_code} starts on {project.start_date.strftime('%d %b %Y')}")
-    lock_days = project_settings_repo.get(db, project.id)["timesheet_lock_days"]
-    if lock_days and day < date.today() - timedelta(days=lock_days):
-        raise TimesheetError(f"Hours older than {lock_days} days are locked for {project.project_code} (Project Settings). Ask the project manager if a correction is needed")
+    if project.end_date and day > project.end_date:
+        raise TimesheetError(f"{project.project_code} ended on {project.end_date.strftime('%d %b %Y')}, so hours after that date cannot be logged")
 
+    _lock_day(db, principal, day)
     entry = (
         _entries(db, principal)
         .filter(TimeEntry.task_id == task.id, TimeEntry.user_id == principal.user_id, TimeEntry.work_date == day)
@@ -175,6 +185,11 @@ def save_entry(db, principal, data: dict):
     )
     if entry is not None and entry.status not in EDITABLE_STATUSES:
         raise TimesheetError(f"Your hours for {day.strftime('%d %b')} on {task.task_key} are {entry.status} and locked")
+    # Old days are closed for new and never-submitted hours; hours a manager sent back (Rejected, or a Draft being
+    # fixed after that - it has a submitted_at) can still be fixed or cleared.
+    lock_days = project_settings_repo.get(db, project.id)["timesheet_lock_days"]
+    if lock_days and day < date.today() - timedelta(days=lock_days) and not _sent_back(entry):
+        raise TimesheetError(f"Hours older than {lock_days} days are locked for {project.project_code} (Project Settings). Ask the project manager if a correction is needed")
 
     others = (
         _entries(db, principal)
@@ -197,9 +212,37 @@ def save_entry(db, principal, data: dict):
     entry.hours = hours
     entry.note = data.get("note")
     entry.status = "Draft"  # an edited rejected entry goes back to Draft until it is submitted again
-    db.commit()
+    _clear_review(entry)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # The same cell was saved at the same moment from somewhere else (ux_time_entry_day).
+        db.rollback()
+        raise TimesheetError("These hours were just saved from another window. Refresh and try again") from exc
     db.refresh(entry)
     return entry
+
+
+def _sent_back(entry) -> bool:
+    return entry is not None and (entry.status == "Rejected" or (entry.status == "Draft" and entry.submitted_at is not None))
+
+
+def _clear_review(entry):
+    """A sent-back entry that is changed or submitted again no longer carries the old review."""
+    entry.reject_reason = None
+    entry.reviewed_by = entry.reviewed_by_name = entry.reviewed_at = None
+
+
+def _lock_day(db, principal, day):
+    """Saves of one person's hours for one day run one after the other (an app lock held until commit), so two
+    saves at the same moment cannot both pass the 24 h check or create the same cell twice."""
+    result = db.execute(
+        text("SET NOCOUNT ON; DECLARE @r int; EXEC @r = sp_getapplock @Resource = :res, @LockMode = 'Exclusive', "
+             "@LockOwner = 'Transaction', @LockTimeout = 10000; SELECT @r"),
+        {"res": f"pms-time:{principal.client_id}:{principal.user_id}:{day.isoformat()}"},
+    ).scalar()
+    if result is None or result < 0:
+        raise TimesheetError("Your hours for this day are being saved from another window. Try again in a moment")
 
 
 def submit_week(db, principal, week_start: date) -> int:
@@ -219,16 +262,27 @@ def submit_week(db, principal, week_start: date) -> int:
     for e in entries:
         e.status = "Submitted"
         e.submitted_at = now
+        _clear_review(e)
     db.commit()
     return len(entries)
 
 
-def _with_context(query):
+def _joined(query):
     return query.join(Task, Task.id == TimeEntry.task_id).join(Project, Project.id == TimeEntry.project_id).join(
         ProjectMember, ProjectMember.id == TimeEntry.member_id
-    ).filter(Project.is_deleted == False).with_entities(  # noqa: E712
+    ).filter(Project.is_deleted == False)  # noqa: E712
+
+
+def _with_context(query):
+    return _joined(query).with_entities(
         TimeEntry, Task.task_key, Task.title, Project.project_code, Project.project_name, ProjectMember.hourly_rate
     )
+
+
+def _cost_expr():
+    """hours x rate in SQL, with the same rule as schemas.timesheets.effective_rate (needs the ProjectMember join)."""
+    rate = case((TimeEntry.status == "Approved", TimeEntry.hourly_rate), else_=func.coalesce(TimeEntry.hourly_rate, ProjectMember.hourly_rate))
+    return TimeEntry.hours * rate
 
 
 def _serialize(rows):
@@ -237,6 +291,12 @@ def _serialize(rows):
 
 def list_entries(db, principal, *, page=1, page_size=20, project_id=None, member=None, status=None, date_from=None, date_to=None):
     query = _entries(db, principal)
+    # Team hours are for people who approve them (and Finance / Resource Managers); everyone else sees their own.
+    from app.core import roles
+    from app.core.access import allowed
+
+    if not allowed(principal, "timesheets", "approve") and getattr(principal, "role_key", None) not in (roles.FINANCE, roles.RESOURCE_MANAGER):
+        query = query.filter(TimeEntry.user_id == principal.user_id)
     if project_id:
         query = query.filter(TimeEntry.project_id == project_id)
     if member:
@@ -250,12 +310,19 @@ def list_entries(db, principal, *, page=1, page_size=20, project_id=None, member
 
     full = _with_context(query)
     total = full.count()
-    all_rows = _serialize(full.all()) if total <= 5000 else []
-    totals = {
-        "hours": round(sum(r["hours"] for r in all_rows), 2),
-        "cost": round(sum(r["cost"] or 0 for r in all_rows), 2),
-        "by_status": {s: round(sum(r["hours"] for r in all_rows if r["status"] == s), 2) for s in ("Draft", "Submitted", "Approved", "Rejected")},
-    }
+    # Totals are summed in SQL, so only the requested page is loaded.
+    sums = (
+        _joined(query)
+        .with_entities(TimeEntry.status, func.coalesce(func.sum(TimeEntry.hours), 0), func.coalesce(func.sum(_cost_expr()), 0))
+        .group_by(TimeEntry.status)
+        .all()
+    )
+    by_status = {s: 0.0 for s in ("Draft", "Submitted", "Approved", "Rejected")}
+    cost = 0.0
+    for s, h, c in sums:
+        by_status[s] = round(float(h), 2)
+        cost += float(c)
+    totals = {"hours": round(sum(by_status.values()), 2), "cost": round(cost, 2), "by_status": by_status}
     rows = full.order_by(TimeEntry.work_date.desc(), TimeEntry.member_name, TimeEntry.id).offset((page - 1) * page_size).limit(page_size).all()
     return _serialize(rows), total, totals
 
@@ -308,6 +375,10 @@ def review(db, principal, entry_ids, approve: bool, reason: str = None) -> int:
         raise TimesheetError("Your login has no user id, so it cannot approve or reject. Please sign in again")
     if any(e.user_id == principal.user_id for e in entries):
         raise TimesheetError("You cannot approve or reject your own time. Another manager has to review it")
+    # A Closed project's cost is final (K3).
+    closed = db.query(Project.project_code).filter(Project.id.in_({e.project_id for e in entries}), Project.status == "Closed").first()
+    if closed:
+        raise TimesheetError(f"{closed[0]} is Closed, so its hours can no longer be approved or rejected")
     from app.repositories import approvals  # local import: approvals reads these models
 
     try:
@@ -317,10 +388,11 @@ def review(db, principal, entry_ids, approve: bool, reason: str = None) -> int:
 
     rates = dict(db.query(ProjectMember.id, ProjectMember.hourly_rate).filter(ProjectMember.id.in_({e.member_id for e in entries})).all())
     now = _utcnow()
+    reviewer_name = notification_repo.person_name(principal.user_name) or principal.user_name
     per_task = defaultdict(float)
     for e in entries:
         e.status = "Approved" if approve else "Rejected"
-        e.reviewed_by, e.reviewed_by_name, e.reviewed_at = principal.user_id, principal.user_name, now
+        e.reviewed_by, e.reviewed_by_name, e.reviewed_at = principal.user_id, reviewer_name, now
         if approve:
             e.hourly_rate = rates.get(e.member_id)
             e.reject_reason = None
@@ -369,32 +441,71 @@ def labour_cost(db, project_id) -> float:
     return round(float(value or 0), 2)
 
 
-def project_budget(db, principal, project, progress_pct: int) -> dict:
-    """Planned budget vs actual cost (approved hours + approved expenses), what is waiting for approval, and where
-    the project is heading."""
+def project_budgets(db, principal, projects, progress, with_revenue=False) -> dict:
+    """{project_id: budget summary} for many projects with a few grouped queries (Budget overview, Dashboard,
+    Reports): planned budget vs actual cost (approved hours + approved expenses), what is waiting for approval
+    (submitted hours + submitted expenses) and where the project is heading. progress is progress_for()'s shape."""
     from app.repositories import expenses as expense_repo  # local import: expenses imports this module lazily too
 
-    rows = _serialize(_with_context(_entries(db, principal).filter(TimeEntry.project_id == project.id)).all())
-    approved = [r for r in rows if r["status"] == "Approved"]
-    pending = [r for r in rows if r["status"] in ("Submitted", "Draft")]
-
-    exp = expense_repo.totals(db, project.id)
-    alert_pct = project_settings_repo.get(db, project.id)["budget_alert_pct"]
-    labour = round(sum(r["cost"] or 0 for r in approved), 2)
-    actual_cost = round(labour + exp["approved"], 2)
-    pending_cost = round(sum(r["cost"] or 0 for r in pending) + exp["submitted"], 2)
-    budget = float(project.budget) if project.budget is not None else None
-    # Forecast at completion: if X% of the work cost Y so far, the whole project costs about Y / X%.
-    forecast = round(actual_cost / (progress_pct / 100), 2) if progress_pct and actual_cost else None
-
-    tasks = (
-        db.query(Task.id, Task.task_key, Task.title, Task.estimated_hours, Task.actual_hours, Task.status)
-        .filter(Task.project_id == project.id, Task.is_deleted == False)  # noqa: E712
+    ids = [p.id for p in projects]
+    if not ids:
+        return {}
+    hours = defaultdict(dict)  # project -> status -> (hours, cost)
+    for pid, status, h, c in (
+        _joined(_entries(db, principal).filter(TimeEntry.project_id.in_(ids), TimeEntry.status.in_(("Approved", "Submitted"))))
+        .with_entities(TimeEntry.project_id, TimeEntry.status, func.coalesce(func.sum(TimeEntry.hours), 0), func.coalesce(func.sum(_cost_expr()), 0))
+        .group_by(TimeEntry.project_id, TimeEntry.status)
+    ):
+        hours[pid][status] = (float(h), float(c))
+    expenses = expense_repo.totals_for(db, ids)
+    alerts = dict(db.query(ProjectSettings.project_id, ProjectSettings.budget_alert_pct).filter(ProjectSettings.project_id.in_(ids)).all())
+    estimates = dict(
+        db.query(Task.project_id, func.coalesce(func.sum(Task.estimated_hours), 0))
+        .filter(Task.project_id.in_(ids), Task.is_deleted == False)  # noqa: E712
+        .group_by(Task.project_id)
         .all()
     )
-    estimated = sum(float(t.estimated_hours or 0) for t in tasks)
-    approved_hours = sum(r["hours"] for r in approved)
+    out = {}
+    for p in projects:
+        progress_pct = progress.get(p.id, {}).get("progress", 0)
+        approved_hours, labour = hours[p.id].get("Approved", (0.0, 0.0))
+        pending_hours, pending_labour = hours[p.id].get("Submitted", (0.0, 0.0))
+        exp = expenses[p.id]
+        alert_pct = alerts.get(p.id)
+        if alert_pct is None:
+            alert_pct = SETTING_DEFAULTS["budget_alert_pct"]
+        labour = round(labour, 2)
+        actual_cost = round(labour + exp["approved"], 2)
+        budget = float(p.budget) if p.budget is not None else None
+        # Forecast at completion: if X% of the work cost Y so far, the whole project costs about Y / X%.
+        forecast = round(actual_cost / (progress_pct / 100), 2) if progress_pct and actual_cost else None
+        estimated = float(estimates.get(p.id) or 0)
+        health, reason = _health(budget, actual_cost, alert_pct, forecast, estimated, approved_hours, progress_pct)
+        out[p.id] = {
+            "budget": budget,
+            "actual_cost": actual_cost,
+            "labour_cost": labour,
+            "expense_cost": exp["approved"],
+            "pending_expenses": exp["submitted"],
+            "billable_expenses": exp["billable_approved"],
+            "pending_cost": round(pending_labour + exp["submitted"], 2),
+            "remaining": round(budget - actual_cost, 2) if budget is not None else None,
+            "used_pct": round(actual_cost / budget * 100, 1) if budget else None,
+            "forecast": forecast,
+            "variance": round(budget - forecast, 2) if budget is not None and forecast is not None else None,
+            "health": health,
+            "health_reason": reason,
+            # Income side: billed (issued + paid, before tax) against the cost of approved hours.
+            **(_revenue(db, p.id, actual_cost) if with_revenue else {}),
+            "progress": progress_pct,
+            "approved_hours": round(approved_hours, 2),
+            "pending_hours": round(pending_hours, 2),
+            "estimated_hours": round(estimated, 2),
+        }
+    return out
 
+
+def _health(budget, actual_cost, alert_pct, forecast, estimated, approved_hours, progress_pct):
     # Health, with the reason shown to the user. Hours past the estimate before the work is done is an early
     # warning that money alone does not show yet (e.g. no rates set, or no progress to forecast from).
     if budget is None:
@@ -409,6 +520,20 @@ def project_budget(db, principal, project, progress_pct: int) -> dict:
         health, reason = "At risk", f"{approved_hours:g} h used against an estimate of {estimated:g} h, with {progress_pct}% of the work done."
     else:
         health, reason = "On track", "Spending is in line with the work done."
+    return health, reason
+
+
+def project_budget(db, principal, project, progress_pct: int) -> dict:
+    """One project's Budget tab: the same summary as project_budgets() plus cost per member, per week and the
+    tasks over their estimate."""
+    summary = project_budgets(db, principal, [project], {project.id: {"progress": progress_pct}}, with_revenue=True)[project.id]
+    rows = _serialize(_with_context(_entries(db, principal).filter(TimeEntry.project_id == project.id)).all())
+    approved = [r for r in rows if r["status"] == "Approved"]
+    tasks = (
+        db.query(Task.id, Task.task_key, Task.title, Task.estimated_hours, Task.actual_hours, Task.status)
+        .filter(Task.project_id == project.id, Task.is_deleted == False)  # noqa: E712
+        .all()
+    )
 
     by_member = {}
     for r in rows:
@@ -419,7 +544,7 @@ def project_budget(db, principal, project, progress_pct: int) -> dict:
             m["cost"] += r["cost"] or 0
             if r["hourly_rate"] is None:
                 m["unrated_hours"] += r["hours"]
-        elif r["status"] in ("Submitted", "Draft"):
+        elif r["status"] == "Submitted":  # waiting for approval; drafts are not sent yet
             m["pending_hours"] += r["hours"]
     current_rates = dict(db.query(ProjectMember.id, ProjectMember.hourly_rate).filter(ProjectMember.project_id == project.id).all())
     for m in by_member.values():
@@ -443,25 +568,7 @@ def project_budget(db, principal, project, progress_pct: int) -> dict:
     )[:10]
 
     return {
-        "budget": budget,
-        "actual_cost": actual_cost,
-        "labour_cost": labour,
-        "expense_cost": exp["approved"],
-        "pending_expenses": exp["submitted"],
-        "billable_expenses": exp["billable_approved"],
-        "pending_cost": pending_cost,
-        "remaining": round(budget - actual_cost, 2) if budget is not None else None,
-        "used_pct": round(actual_cost / budget * 100, 1) if budget else None,
-        "forecast": forecast,
-        "variance": round(budget - forecast, 2) if budget is not None and forecast is not None else None,
-        "health": health,
-        "health_reason": reason,
-        # Income side: billed (issued + paid, before tax) against the cost of approved hours.
-        **_revenue(db, project.id, actual_cost),
-        "progress": progress_pct,
-        "approved_hours": round(sum(r["hours"] for r in approved), 2),
-        "pending_hours": round(sum(r["hours"] for r in pending), 2),
-        "estimated_hours": round(estimated, 2),
+        **summary,
         "unrated_hours": round(sum(m["unrated_hours"] for m in by_member.values()), 2),
         "by_member": sorted(by_member.values(), key=lambda m: -m["cost"]),
         "by_week": list(by_week.values()),

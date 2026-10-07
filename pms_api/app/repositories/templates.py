@@ -2,6 +2,7 @@
 start. Dates are kept as "day N from the start" (day 0 = the first day)."""
 from datetime import timedelta
 
+from pydantic import ValidationError
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,7 @@ from app.repositories import tasks as task_repo
 from app.repositories.notifications import person_name
 from app.repositories.task_activity import log_activity
 from app.schemas.rules import utc_iso
+from app.schemas.settings import MAX_TEMPLATE_DAYS, MAX_TEMPLATE_MILESTONES, MAX_TEMPLATE_TASKS, TemplateIn
 
 
 class TemplateError(Exception):
@@ -135,6 +137,21 @@ def from_project(db, principal, project, name, description) -> ProjectTemplate:
             "milestone_index": m_index.get(t.milestone_id), "parent_index": t_index.get(t.parent_task_id),
         } for t in tasks],
     }
+    # Same rules as the Template editor, so a saved template can always be opened and saved again.
+    if data["duration_days"] > MAX_TEMPLATE_DAYS:
+        raise TemplateError(f"{project.project_code} runs {data['duration_days']} days; a template can cover at most {MAX_TEMPLATE_DAYS} days")
+    if len(milestones) > MAX_TEMPLATE_MILESTONES or len(tasks) > MAX_TEMPLATE_TASKS:
+        raise TemplateError(f"A template can hold at most {MAX_TEMPLATE_MILESTONES} milestones and {MAX_TEMPLATE_TASKS} tasks; "
+                            f"{project.project_code} has {len(milestones)} milestones and {len(tasks)} tasks")
+    try:
+        data = TemplateIn(**data).model_dump()
+    except ValidationError as exc:
+        err = exc.errors()[0]
+        loc = err.get("loc", ())
+        msg = str(err.get("msg", "")).removeprefix("Value error, ")
+        if len(loc) >= 3 and loc[0] in ("tasks", "milestones") and isinstance(loc[1], int):
+            msg = f"{'Task' if loc[0] == 'tasks' else 'Milestone'} {loc[1] + 1} ({str(loc[2]).replace('_', ' ')}): {msg}"
+        raise TemplateError(f"{project.project_code} cannot be saved as a template. {msg}")
     return create_template(db, principal, data, source_project_code=project.project_code)
 
 
@@ -167,6 +184,7 @@ def create_project(db, principal, t: ProjectTemplate, project_data: dict) -> tup
         db.flush()
         milestone_ids.append(row.id)
     task_ids = []
+    later_parent = []  # (task row, parent index) for subtasks listed above their parent: linked once all exist
     for x in ts:
         s = start + timedelta(days=x.start_offset) if x.start_offset is not None else None
         due = s + timedelta(days=(x.duration_days or 1) - 1) if s else None
@@ -179,7 +197,12 @@ def create_project(db, principal, t: ProjectTemplate, project_data: dict) -> tup
         db.add(row)
         db.flush()
         task_ids.append(row.id)
+        if x.parent_index is not None and row.parent_task_id is None:
+            later_parent.append((row, x.parent_index))
         log_activity(db, principal, row.id, "created", f"Created from template '{t.name}'")
+    for row, parent_index in later_parent:
+        if parent_index < len(task_ids):
+            row.parent_task_id = task_ids[parent_index]
     t.times_used = (t.times_used or 0) + 1
     db.commit()
     db.refresh(project)

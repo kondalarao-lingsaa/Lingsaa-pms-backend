@@ -30,6 +30,7 @@ from app.models import expenses as expense_models  # noqa: E402,F401  (registers
 from app.models import project_settings as project_settings_models  # noqa: E402,F401  (registers tables on Base)
 from app.models import roles as role_models  # noqa: E402,F401  (registers tables on Base)
 from app.models import access as access_models  # noqa: E402,F401  (registers tables on Base)
+from app.models import automation as automation_models  # noqa: E402,F401  (registers tables on Base)
 from app.models.roles import SCHEMA, DefaultRole, DefaultRolePermission  # noqa: E402
 
 

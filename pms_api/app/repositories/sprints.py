@@ -1,8 +1,8 @@
 """Sprints (time-boxed commitments), the product backlog, capacity, burndown and velocity."""
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session, aliased
 
 from app.models.projects import Project
 from app.models.sprints import MAX_SPRINT_DAYS, Sprint
@@ -44,24 +44,36 @@ def _sprint_tasks(db, sprint_id):
     return db.query(Task).filter(Task.sprint_id == sprint_id, Task.is_deleted == False).all()  # noqa: E712
 
 
-def capacity_hours(db, cal, project_id, start, end) -> float:
-    """Team capacity for the sprint: working days x hours per day (company calendar) x each member's allocation %."""
-    days = cal.count(start, end)
-    allocation = db.query(func.coalesce(func.sum(ProjectMember.allocation_pct), 0)).filter(
-        ProjectMember.project_id == project_id, ProjectMember.is_deleted == False  # noqa: E712
-    ).scalar()
-    return round(days * cal.hours_per_day * float(allocation) / 100, 2)
+def capacity_hours(db, cal, project_id, start, end, as_of=None) -> float:
+    """Team capacity for the sprint: each member's working days inside the sprint (their From/To dates on the
+    project, company calendar) x hours per day x their allocation %. as_of (a completed sprint's completion
+    time) counts the team as it was then: members added later are left out, members removed later still count."""
+    query = db.query(ProjectMember).filter(ProjectMember.project_id == project_id)
+    if as_of:
+        query = query.filter(ProjectMember.created_at <= as_of, (ProjectMember.is_deleted == False) | (ProjectMember.updated_at > as_of))  # noqa: E712
+    else:
+        query = query.filter(ProjectMember.is_deleted == False)  # noqa: E712
+    total = 0.0
+    for m in query:
+        if not m.allocation_pct:
+            continue
+        days = cal.count(max(start, m.start_date) if m.start_date else start, min(end, m.end_date) if m.end_date else end)
+        total += days * cal.hours_per_day * float(m.allocation_pct) / 100
+    return round(total, 2)
 
 
 def sprint_out(db, s) -> dict:
     tasks = _sprint_tasks(db, s.id)
     today = date.today()
-    committed = sum(float(t.estimated_hours or 0) for t in tasks)
-    done = sum(float(t.estimated_hours or 0) for t in tasks if t.status == "Done")
-    cal = work_calendar.for_client(db, s.client_id)
-    capacity = capacity_hours(db, cal, s.project_id, s.start_date, s.end_date)
-    by_status = {st: sum(1 for t in tasks if t.status == st) for st in ("To Do", "In Progress", "Testing", "Done")}
     completed = s.status == "Completed"
+    # A completed sprint's numbers are the ones frozen when it closed (its unfinished tasks have moved on since).
+    committed = float(s.committed_hours or 0) if completed else sum(float(t.estimated_hours or 0) for t in tasks)
+    done = float(s.completed_hours or 0) if completed else sum(float(t.estimated_hours or 0) for t in tasks if t.status == "Done")
+    cal = work_calendar.for_client(db, s.client_id)
+    capacity = capacity_hours(db, cal, s.project_id, s.start_date, s.end_date, as_of=s.completed_at if completed else None)
+    by_status = {st: sum(1 for t in tasks if t.status == st) for st in ("To Do", "In Progress", "Testing", "Done")}
+    task_total = (s.committed_tasks or 0) if completed else len(tasks)
+    task_done = (s.completed_tasks or 0) if completed else by_status["Done"]
     return {
         "id": s.id, "sprint_key": s.sprint_key, "project_id": s.project_id, "name": s.name, "goal": s.goal,
         "start_date": s.start_date.isoformat(), "end_date": s.end_date.isoformat(), "status": s.status,
@@ -69,13 +81,13 @@ def sprint_out(db, s) -> dict:
         "days_left": max(0, (s.end_date - today).days + 1) if s.status == "Active" else None,
         "is_overdue": s.status == "Active" and s.end_date < today,
         "task_count": len(tasks), "by_status": by_status, "unestimated": sum(1 for t in tasks if not t.estimated_hours),
-        "committed_hours": float(s.committed_hours) if completed else round(committed, 2),
-        "done_hours": float(s.completed_hours) if completed else round(done, 2),
-        "committed_tasks": s.committed_tasks if completed else len(tasks),
-        "completed_tasks": s.completed_tasks if completed else by_status["Done"],
+        "committed_hours": round(committed, 2),
+        "done_hours": round(done, 2),
+        "committed_tasks": task_total,
+        "completed_tasks": task_done,
         "capacity_hours": capacity,
         "load_pct": round(committed / capacity * 100) if capacity else None,
-        "progress": round(done / committed * 100) if committed else (round(by_status["Done"] / len(tasks) * 100) if tasks else 0),
+        "progress": round(done / committed * 100) if committed else (round(task_done / task_total * 100) if task_total else 0),
         "started_at": utc_iso(s.started_at), "completed_at": utc_iso(s.completed_at),
     }
 
@@ -83,6 +95,22 @@ def sprint_out(db, s) -> dict:
 def list_sprints(db, principal, project_id) -> list:
     rows = _live(db, principal).filter(Sprint.project_id == project_id).order_by(Sprint.start_date, Sprint.id).all()
     return [sprint_out(db, s) for s in rows]
+
+
+def _lock(db, project_id) -> None:
+    """Holds the project row until commit, so two people changing the project's sprints at the same moment
+    are checked one after the other (one Active sprint, unique names, no overlaps)."""
+    db.execute(text("SELECT id FROM projectmanagement.projects WITH (UPDLOCK, HOLDLOCK) WHERE id = :p"), {"p": project_id})
+
+
+def _open_project(db, sprint):
+    """The sprint's project, locked; a Closed project's sprints are history and no longer change."""
+    _lock(db, sprint.project_id)
+    db.refresh(sprint)
+    project = db.query(Project).filter(Project.id == sprint.project_id).populate_existing().one()
+    if project.status == "Closed":
+        raise SprintError(f"{project.project_code} is Closed, so its sprints can no longer change")
+    return project
 
 
 def _check(db, principal, project, data, own_id=None):
@@ -108,6 +136,7 @@ def _check(db, principal, project, data, own_id=None):
 
 
 def create_sprint(db, principal, project, data) -> Sprint:
+    _lock(db, project.id)
     _check(db, principal, project, data)
     sprint = Sprint(**data, client_id=principal.client_id, project_id=project.id, sprint_key=_next_key(db, project, "S"), created_by=principal.user_id)
     db.add(sprint)
@@ -117,6 +146,8 @@ def create_sprint(db, principal, project, data) -> Sprint:
 
 
 def update_sprint(db, principal, project, sprint, data) -> Sprint:
+    _lock(db, project.id)
+    db.refresh(sprint)
     if sprint.status == "Completed":
         raise SprintError(f"{sprint.name} is Completed and kept as history")
     if sprint.status == "Active" and data["start_date"] != sprint.start_date:
@@ -130,6 +161,7 @@ def update_sprint(db, principal, project, sprint, data) -> Sprint:
 
 
 def delete_sprint(db, principal, sprint) -> None:
+    _open_project(db, sprint)
     if sprint.status != "Planned":
         raise SprintError(f"{sprint.name} is {sprint.status}; only Planned sprints can be deleted")
     db.query(Task).filter(Task.sprint_id == sprint.id).update({Task.sprint_id: None}, synchronize_session=False)
@@ -138,6 +170,7 @@ def delete_sprint(db, principal, sprint) -> None:
 
 
 def add_tasks(db, principal, sprint, task_ids) -> int:
+    _open_project(db, sprint)
     if sprint.status == "Completed":
         raise SprintError(f"{sprint.name} is Completed")
     moved = 0
@@ -148,9 +181,10 @@ def add_tasks(db, principal, sprint, task_ids) -> int:
         if task.status == "Done":
             raise SprintError(f"{task.task_key} is already Done, so it does not need a sprint")
         # A main task brings its subtasks along; a subtask goes with its parent's sprint.
+        # (A subtask whose main task is already Done is planned on its own.)
         if task.parent_task_id:
             parent = task_repo.get_task(db, principal, task.parent_task_id)
-            if parent and parent.sprint_id != sprint.id:
+            if parent and parent.status != "Done" and parent.sprint_id != sprint.id:
                 raise SprintError(f"{task.task_key} is a subtask of {parent.task_key}; add {parent.task_key} to the sprint instead")
         family = [task] + db.query(Task).filter(Task.parent_task_id == task.id, Task.is_deleted == False, Task.status != "Done").all()  # noqa: E712
         for t in family:
@@ -170,8 +204,13 @@ def remove_task(db, principal, sprint, task_id) -> None:
     task = task_repo.get_task(db, principal, task_id)
     if task is None or task.sprint_id != sprint.id:
         raise LookupError("That task is not in this sprint")
+    _open_project(db, sprint)
     if sprint.status == "Completed":
         raise SprintError(f"{sprint.name} is Completed and kept as history")
+    if task.parent_task_id:
+        parent = task_repo.get_task(db, principal, task.parent_task_id)
+        if parent and parent.status != "Done" and parent.sprint_id == sprint.id:
+            raise SprintError(f"{task.task_key} is a subtask of {parent.task_key}; it stays with {parent.task_key}. Move {parent.task_key} back instead")
     for t in [task] + db.query(Task).filter(Task.parent_task_id == task.id, Task.sprint_id == sprint.id).all():
         log_activity(db, principal, t.id, "sprint", f"Moved from sprint {sprint.name} back to the backlog")
         t.sprint_id = None
@@ -179,6 +218,8 @@ def remove_task(db, principal, sprint, task_id) -> None:
 
 
 def start_sprint(db, principal, project, sprint) -> Sprint:
+    _lock(db, project.id)
+    db.refresh(sprint)
     if sprint.status != "Planned":
         raise SprintError(f"{sprint.name} is already {sprint.status}")
     if project.status != "Active":
@@ -196,11 +237,16 @@ def start_sprint(db, principal, project, sprint) -> Sprint:
 
 
 def complete_sprint(db, principal, project, sprint, move_to_sprint_id=None) -> dict:
-    """Closes the sprint, freezes its numbers, and moves unfinished tasks to the next sprint or the backlog."""
+    """Closes the sprint, freezes its numbers, and moves unfinished tasks to the next sprint or the backlog.
+    Allowed on a Closed project too, so a sprint left Active when the project closed can still be finished."""
+    _lock(db, project.id)
+    db.refresh(sprint)
     if sprint.status != "Active":
         raise SprintError(f"Only an active sprint can be completed ({sprint.name} is {sprint.status})")
     target = None
     if move_to_sprint_id:
+        if project.status == "Closed":
+            raise SprintError(f"{project.project_code} is Closed: unfinished tasks go back to the backlog, not to another sprint")
         target = get_sprint(db, principal, move_to_sprint_id)
         if target is None or target.project_id != project.id or target.status != "Planned":
             raise SprintError("Unfinished tasks can only move to a Planned sprint of this project")
@@ -220,34 +266,64 @@ def complete_sprint(db, principal, project, sprint, move_to_sprint_id=None) -> d
 
 
 def backlog(db, principal, project_id) -> list:
-    """Open main tasks not in any open sprint (tasks left in a completed sprint count as backlog too), best first."""
+    """Open main tasks not in any open sprint (tasks left in a completed sprint count as backlog too), best first.
+    An open subtask whose main task is already Done is listed on its own, so it can still be planned."""
     open_sprints = [sid for (sid,) in _live(db, principal).filter(Sprint.project_id == project_id, Sprint.status != "Completed").with_entities(Sprint.id)]
-    query = task_repo._scoped(db, principal).filter(Task.project_id == project_id, Task.status != "Done", Task.parent_task_id == None)  # noqa: E711
+    parent = aliased(Task)
+    done_parents = select(parent.id).where(parent.project_id == project_id, parent.status == "Done")
+    query = task_repo._scoped(db, principal).filter(
+        Task.project_id == project_id, Task.status != "Done", (Task.parent_task_id == None) | Task.parent_task_id.in_(done_parents)  # noqa: E711
+    )
     if open_sprints:
         query = query.filter((Task.sprint_id == None) | (Task.sprint_id.notin_(open_sprints)))  # noqa: E711
     rows = task_repo.serialize(db, query.with_entities(Task, Project.project_code, Project.project_name).all())
     return sorted(rows, key=lambda t: (PRIORITY_RANK.get(t["priority"], 9), t["due_date"] or "9999", t["task_key"]))
 
 
+def _new_status(action, detail):
+    """The status a task moved to, read from its activity row: "To Do -> Done" (status) or
+    "...; Status: To Do -> Done; ..." (Edit Task form). None when the row did not change the status."""
+    if not detail:
+        return None
+    if action == "status":
+        return detail.split("->")[-1].strip()
+    part = next((p for p in detail.split("; ") if p.startswith("Status: ") and "->" in p), None)
+    return part.split("->")[-1].strip() if part else None
+
+
 def burndown(db, principal, sprint) -> dict:
-    """Remaining estimated hours per day of the sprint (from when tasks were marked Done), with the ideal line."""
+    """Remaining estimated hours per day of the sprint (from when tasks were marked Done), with the ideal line.
+
+    A completed sprint keeps its frozen committed hours as the total (its unfinished tasks have moved on, so
+    they never burn down) and its tasks count as Done on the day they were marked Done before it closed."""
     tasks = _sprint_tasks(db, sprint.id)
-    total = sum(float(t.estimated_hours or 0) for t in tasks)
+    completed = sprint.status == "Completed" and sprint.completed_at is not None
+    total = float(sprint.committed_hours or 0) if completed else sum(float(t.estimated_hours or 0) for t in tasks)
     done_on = {}
     ids = [t.id for t in tasks] or [-1]
-    for tid, when, detail in db.query(TaskActivity.task_id, TaskActivity.created_at, TaskActivity.detail).filter(
-        TaskActivity.task_id.in_(ids), TaskActivity.action == "status"
-    ).order_by(TaskActivity.created_at):
-        if detail and detail.split("->")[-1].strip().startswith("Done"):
+    # Status changes come from the board / status button ("status") and from the Edit Task form ("updated").
+    activity = db.query(TaskActivity.task_id, TaskActivity.created_at, TaskActivity.action, TaskActivity.detail).filter(
+        TaskActivity.task_id.in_(ids), TaskActivity.action.in_(("status", "updated"))
+    )
+    if completed:
+        activity = activity.filter(TaskActivity.created_at <= sprint.completed_at)
+    for tid, when, action, detail in activity.order_by(TaskActivity.created_at, TaskActivity.id):
+        new_status = _new_status(action, detail)
+        if new_status is None:
+            continue
+        if new_status.startswith("Done"):
             done_on[tid] = when.date()
         elif tid in done_on:
             done_on.pop(tid)  # reopened later
     days = (sprint.end_date - sprint.start_date).days + 1
     today = date.today()
+    last_day = sprint.completed_at.date() if completed else today
+    # Tasks still in a completed sprint were all Done when it closed (the unfinished ones were moved out).
+    burned = tasks if completed else [t for t in tasks if t.status == "Done"]
     points = []
     for i in range(days):
         day = sprint.start_date + timedelta(days=i)
-        remaining = total - sum(float(t.estimated_hours or 0) for t in tasks if t.status == "Done" and done_on.get(t.id, today) <= day)
+        remaining = total - sum(float(t.estimated_hours or 0) for t in burned if done_on.get(t.id, last_day) <= day)
         points.append({"date": day.isoformat(), "ideal": round(total - total * i / max(days - 1, 1), 2), "remaining": round(remaining, 2) if day <= today else None})
     return {"total": round(total, 2), "points": points}
 

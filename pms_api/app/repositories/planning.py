@@ -8,6 +8,7 @@ from app.models.milestones import Milestone
 from app.models.projects import Project
 from app.models.tasks import Task, TaskDependency
 from app.repositories import projects as project_repo
+from app.repositories import work_calendar
 from app.repositories.task_activity import log_activity
 from app.core.access import project_scope
 
@@ -36,36 +37,33 @@ def _dependencies(db, task_ids):
     return db.query(TaskDependency).filter(TaskDependency.task_id.in_(task_ids), TaskDependency.depends_on_id.in_(task_ids)).all()
 
 
-def _critical_path(tasks, deps) -> list:
-    """Longest chain of dependent, dated tasks (by calendar days): delaying any of them delays the end."""
+def _critical_path(tasks, deps, cal=None) -> list:
+    """Dated tasks that decide when the plan ends, from their real dates: the task(s) due last, then, walking back
+    through the dependencies, every blocker due right before its waiting task starts (no working day in between).
+    Delaying any of them delays the end."""
     dated = {t.id: t for t in tasks if t.start_date and t.due_date}
+    if not dated:
+        return []
     preds = defaultdict(list)
     for d in deps:
         if d.task_id in dated and d.depends_on_id in dated:
             preds[d.task_id].append(d.depends_on_id)
-    finish, best_pred = {}, {}
 
-    def earliest(tid, stack=()):
-        if tid in finish:
-            return finish[tid]
-        if tid in stack:  # defensive: loops are refused when links are added
-            return 0
-        duration = (dated[tid].due_date - dated[tid].start_date).days + 1
-        chain = [(earliest(p, stack + (tid,)), p) for p in preds[tid]]
-        longest, pred = max(chain) if chain else (0, None)
-        finish[tid], best_pred[tid] = longest + duration, pred
-        return finish[tid]
+    def no_slack(blocker, task):
+        day_before = task.start_date - timedelta(days=1)
+        if blocker.due_date >= day_before:
+            return True
+        return cal is not None and cal.count(blocker.due_date + timedelta(days=1), day_before) == 0
 
-    for tid in dated:
-        earliest(tid)
-    if not finish:
-        return []
-    end = max(finish, key=finish.get)
-    path = []
-    while end is not None:
-        path.append(end)
-        end = best_pred.get(end)
-    return list(reversed(path)) if len(path) > 1 else []
+    end = max(t.due_date for t in dated.values())
+    critical, frontier = set(), [tid for tid, t in dated.items() if t.due_date == end]
+    while frontier:
+        tid = frontier.pop()
+        if tid in critical:  # also guards against loops (refused when links are added)
+            continue
+        critical.add(tid)
+        frontier.extend(p for p in preds[tid] if no_slack(dated[p], dated[tid]))
+    return sorted(critical, key=lambda i: (dated[i].start_date, dated[i].due_date, i))
 
 
 def _warnings(project, tasks, deps, milestones, by_id):
@@ -99,7 +97,7 @@ def project_timeline(db: Session, principal, project) -> dict:
     by_id = {t.id: t for t in tasks}
     deps = _dependencies(db, list(by_id))
     milestones = db.query(Milestone).filter(Milestone.project_id == project.id, Milestone.is_deleted == False).order_by(Milestone.due_date).all()  # noqa: E712
-    critical = _critical_path(tasks, deps)
+    critical = _critical_path(tasks, deps, work_calendar.for_client(db, project.client_id))
 
     dates = [d for t in tasks for d in (t.start_date, t.due_date) if d] + [m.due_date for m in milestones if m.due_date]
     dates += [d for d in (project.start_date, project.end_date) if d]
@@ -137,30 +135,41 @@ def project_timeline(db: Session, principal, project) -> dict:
     }
 
 
+def check_dates(db: Session, project: Project, task_key: str, start, due, task_id=None, status=None) -> None:
+    """The scheduling rules every date change follows (timeline drag, calendar, task create and edit): inside the
+    project's dates, after open blockers are due and before the tasks waiting for this one start. A task with
+    only one date is treated as starting and ending on it. task_id is None for a task not saved yet (no links)."""
+    if not start and not due:
+        return
+    start, due = start or due, due or start
+    if due < start:
+        raise PlanningError("The due date cannot be before the start date")
+    if project.start_date and start < project.start_date:
+        raise PlanningError(f"{task_key} cannot start before the project starts ({_fmt(project.start_date)})")
+    if project.end_date and due > project.end_date:
+        raise PlanningError(f"{task_key} cannot be due after the project ends ({_fmt(project.end_date)}). Raise a change request to extend the project")
+    if task_id is None:
+        return
+    live = Task.is_deleted == False  # noqa: E712
+    blockers = db.query(Task).join(TaskDependency, TaskDependency.depends_on_id == Task.id).filter(TaskDependency.task_id == task_id, live).all()
+    late_blockers = [b for b in blockers if b.due_date and start <= b.due_date and b.status != "Done"]
+    if late_blockers and status != "Done":
+        b = max(late_blockers, key=lambda b: b.due_date)
+        raise PlanningError(f"{task_key} waits for {b.task_key} (due {_fmt(b.due_date)}), so it can start from {_fmt(b.due_date + timedelta(days=1))}")
+    waiting = db.query(Task).join(TaskDependency, TaskDependency.task_id == Task.id).filter(TaskDependency.depends_on_id == task_id, live).all()
+    pushed = [w for w in waiting if w.start_date and w.start_date <= due and w.status != "Done"]
+    if pushed:
+        w = min(pushed, key=lambda w: w.start_date)
+        raise PlanningError(f"{w.task_key} waits for {task_key} and starts {_fmt(w.start_date)}, so {task_key} must be due by {_fmt(w.start_date - timedelta(days=1))}. Move {w.task_key} first")
+
+
 def reschedule(db: Session, principal, task: Task, new_start, due: date) -> Task:
     """New dates for a task (dragged on the timeline or calendar), checked against the project and its dependencies.
     new_start may be None for a task that only has a due date; the checks then treat the due date as its start."""
     project = db.query(Project).filter(Project.id == task.project_id).one()
     if project.status == "Closed":
         raise PlanningError(f"{project.project_code} is Closed, so its plan can no longer change")
-    start = new_start or due
-    if due < start:
-        raise PlanningError("The due date cannot be before the start date")
-    if project.start_date and start < project.start_date:
-        raise PlanningError(f"{task.task_key} cannot start before the project starts ({_fmt(project.start_date)})")
-    if project.end_date and due > project.end_date:
-        raise PlanningError(f"{task.task_key} cannot be due after the project ends ({_fmt(project.end_date)}). Raise a change request to extend the project")
-    live = Task.is_deleted == False  # noqa: E712
-    blockers = db.query(Task).join(TaskDependency, TaskDependency.depends_on_id == Task.id).filter(TaskDependency.task_id == task.id, live).all()
-    late_blockers = [b for b in blockers if b.due_date and start <= b.due_date and b.status != "Done"]
-    if late_blockers and task.status != "Done":
-        b = max(late_blockers, key=lambda b: b.due_date)
-        raise PlanningError(f"{task.task_key} waits for {b.task_key} (due {_fmt(b.due_date)}), so it can start from {_fmt(b.due_date + timedelta(days=1))}")
-    waiting = db.query(Task).join(TaskDependency, TaskDependency.task_id == Task.id).filter(TaskDependency.depends_on_id == task.id, live).all()
-    pushed = [w for w in waiting if w.start_date and w.start_date <= due and w.status != "Done"]
-    if pushed:
-        w = min(pushed, key=lambda w: w.start_date)
-        raise PlanningError(f"{w.task_key} waits for {task.task_key} and starts {_fmt(w.start_date)}, so {task.task_key} must be due by {_fmt(w.start_date - timedelta(days=1))}. Move {w.task_key} first")
+    check_dates(db, project, task.task_key, new_start, due, task_id=task.id, status=task.status)
 
     if task.start_date == new_start and task.due_date == due:
         return task

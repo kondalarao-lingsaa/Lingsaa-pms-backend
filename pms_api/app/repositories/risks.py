@@ -46,6 +46,15 @@ def _open_project(project):
         raise RiskError(f"{project.project_code} is Closed, so its risks, issues and changes can no longer change")
 
 
+def _lock(db, project, *rows):
+    """Holds the project row until commit and re-reads `rows`, so two people acting at the same moment
+    (approving changes, "It Happened", a fix task) are handled one after the other and the second one sees
+    the first one's result instead of overwriting it."""
+    db.execute(text("SELECT id FROM projectmanagement.projects WITH (UPDLOCK, HOLDLOCK) WHERE id = :p"), {"p": project.id})
+    for row in (project, *rows):
+        db.refresh(row)
+
+
 def _owner(db, project, member_id):
     if not member_id:
         return None, None
@@ -53,6 +62,21 @@ def _owner(db, project, member_id):
     if member is None:
         raise RiskError("The owner must be a member of this project's team")
     return member.id, member.member_name
+
+
+def _kept_owner(db, project, record, member_id):
+    """Like _owner, but an unchanged owner who has since left the team is kept, so the rest of the record can still
+    be edited (the drawer shows them as having left, and they can be replaced there)."""
+    if member_id and member_id == record.owner_member_id:
+        return record.owner_member_id, record.owner_name
+    return _owner(db, project, member_id)
+
+
+def _active_owner(db, project, member_id):
+    """The member, if still in the team; a risk's owner who has left does not carry over to its issue or fix task."""
+    if not member_id:
+        return None
+    return db.query(ProjectMember).filter(ProjectMember.id == member_id, ProjectMember.project_id == project.id, ProjectMember.is_deleted == False).one_or_none()  # noqa: E712
 
 
 def _milestone(db, project, milestone_id):
@@ -133,7 +157,7 @@ def update_risk(db, principal, project, risk, data) -> Risk:
     if risk.status == "Closed":
         raise RiskError(f"{risk.risk_key} is Closed. Reopen it to make changes")
     _check_review_date(data, risk.review_date)
-    data["owner_member_id"], owner_name = _owner(db, project, data.get("owner_member_id"))
+    data["owner_member_id"], owner_name = _kept_owner(db, project, risk, data.get("owner_member_id"))
     _milestone(db, project, data.get("milestone_id"))
     for key, value in data.items():
         setattr(risk, key, value)
@@ -161,12 +185,15 @@ def change_risk_status(db, principal, project, risk, new_status) -> Risk:
 def risk_occurred(db, principal, project, risk) -> Issue:
     """The risk happened: it becomes an Issue (same owner, severity from the risk level)."""
     _open_project(project)
+    _lock(db, project, risk)
     if risk.status not in ("Open", "Monitoring", "Mitigated"):
         raise RiskError(f"{risk.risk_key} is {risk.status}")
+    owner = _active_owner(db, project, risk.owner_member_id)
     issue = Issue(
         client_id=principal.client_id, project_id=project.id, issue_key=_next_key(db, project, "I"), title=risk.title,
         description=f"Raised from risk {risk.risk_key}." + (f" Contingency plan: {risk.contingency}" if risk.contingency else ""),
-        severity=LEVEL_TO_SEVERITY[risk_level(risk.probability * risk.impact)], owner_member_id=risk.owner_member_id, owner_name=risk.owner_name,
+        severity=LEVEL_TO_SEVERITY[risk_level(risk.probability * risk.impact)],
+        owner_member_id=owner.id if owner else None, owner_name=owner.member_name if owner else None,
         due_date=date.today() + timedelta(days=7), risk_id=risk.id, raised_by_name=principal.user_name,
         created_by=principal.user_id, updated_by=principal.user_id,
     )
@@ -250,7 +277,7 @@ def update_issue(db, principal, project, issue, data) -> Issue:
         raise RiskError(f"{issue.issue_key} is Closed")
     if data.get("due_date") and data["due_date"] != issue.due_date and data["due_date"] < date.today():
         raise RiskError("The due date cannot be in the past")
-    data["owner_member_id"], owner_name = _owner(db, project, data.get("owner_member_id"))
+    data["owner_member_id"], owner_name = _kept_owner(db, project, issue, data.get("owner_member_id"))
     data.pop("risk_id", None)  # the source risk does not change after the issue is raised
     for key, value in data.items():
         setattr(issue, key, value)
@@ -275,7 +302,9 @@ def change_issue_status(db, principal, project, issue, new_status, resolution=No
         issue.resolution = resolution
         issue.resolved_at = _utcnow()
     if new_status in ("Open", "In Progress"):
+        # Reopened: the old fix did not hold, so its resolution no longer describes the issue.
         issue.resolved_at = None
+        issue.resolution = None
     issue.status = new_status
     issue.updated_by = principal.user_id
     db.commit()
@@ -286,11 +315,16 @@ def change_issue_status(db, principal, project, issue, new_status, resolution=No
 def create_fix_task(db, principal, project, issue) -> Task:
     """Puts the fix on the board: a task with the issue's owner and a priority from its severity."""
     _open_project(project)
+    _lock(db, project, issue)
     if issue.status in ("Resolved", "Closed"):
         raise RiskError(f"{issue.issue_key} is {issue.status}")
-    if issue.task_id and db.query(Task).filter(Task.id == issue.task_id, Task.is_deleted == False).first():  # noqa: E712
+    # The task is saved before the issue points at it, so also look for the task itself (a second click at the
+    # same moment would otherwise add another one).
+    made = db.query(Task.id).filter(Task.project_id == project.id, Task.is_deleted == False,  # noqa: E712
+                                    Task.description.like(f"Fix for issue {issue.issue_key}.%")).first()
+    if made or (issue.task_id and db.query(Task).filter(Task.id == issue.task_id, Task.is_deleted == False).first()):  # noqa: E712
         raise RiskError(f"{issue.issue_key} already has a fix task")
-    owner = db.query(ProjectMember).filter(ProjectMember.id == issue.owner_member_id).one_or_none() if issue.owner_member_id else None
+    owner = _active_owner(db, project, issue.owner_member_id)  # an owner who left the team: the task starts unassigned
     try:
         task = task_repo.create_task(db, principal, {
             "project_id": project.id, "title": f"Fix: {issue.title}"[:300], "description": f"Fix for issue {issue.issue_key}. {issue.description or ''}".strip()[:4000],
@@ -309,6 +343,11 @@ def create_fix_task(db, principal, project, issue) -> Task:
 
 def delete_issue(db, principal, project, issue) -> None:
     _open_project(project)
+    if issue.task_id:
+        task = db.query(Task).filter(Task.id == issue.task_id, Task.is_deleted == False).one_or_none()  # noqa: E712
+        if task is not None and task.status != "Done":
+            raise RiskError(f"{issue.issue_key} has an open fix task {task.task_key} ({task.status}). "
+                            "Finish or delete that task first")
     issue.is_deleted = True
     issue.updated_by = principal.user_id
     db.commit()
@@ -354,23 +393,70 @@ def _check_milestone_changeable(db, milestone):
         raise RiskError(f"'{milestone.name}' is already invoiced, so its amount cannot change")
 
 
-def create_change(db, principal, project, data) -> ChangeRequest:
+CHANGEABLE_PROJECT_STATUSES = ("Approved", "Active", "On Hold")
+# The largest values the project and milestone forms accept (ProjectIn.budget, MilestoneIn.amount).
+MAX_BUDGET = Decimal("9999999999.99")
+MAX_MILESTONE_AMOUNT = Decimal("999999999999.99")
+
+
+def _changeable_project(project):
+    """Change requests change an approved plan. A Draft is edited directly, and a project waiting for approval
+    must not change under its approver (its approval levels were worked out from the submitted budget)."""
     _open_project(project)
+    if project.status not in CHANGEABLE_PROJECT_STATUSES:
+        raise RiskError(f"{project.project_code} is {project.status}. Change requests are for approved projects - "
+                        + ("edit the project directly" if project.status == "Draft" else "wait for the approval decision"))
+
+
+def create_change(db, principal, project, data) -> ChangeRequest:
+    _changeable_project(project)
     milestone = _milestone(db, project, data.get("milestone_id"))
     if milestone:
         _check_milestone_changeable(db, milestone)
     change = ChangeRequest(**data, client_id=principal.client_id, project_id=project.id, cr_key=_next_key(db, project, "CR"),
                            raised_by=principal.user_id, raised_by_name=principal.user_name)
     db.add(change)
+    _notify_change(db, principal, project, change, None)
     db.commit()
     db.refresh(change)
     return change
 
 
+def _impact_text(change) -> str:
+    parts = []
+    if change.cost_impact:
+        parts.append(f"cost {'+' if change.cost_impact > 0 else ''}{float(change.cost_impact):,.0f}")
+    if change.days_impact:
+        parts.append(f"{'+' if change.days_impact > 0 else ''}{change.days_impact} days")
+    return ", ".join(parts) or "scope only"
+
+
+def _notify_change(db, principal, project, change, decided):
+    """A new change asks its approvers to decide; a decision tells the person who raised it."""
+    from app.repositories import approvals, notifications as notification_repo  # local import: both read these models
+
+    link = f"risks/changeRequests/?projectId={project.id}"
+    if decided is None:
+        notification_repo.notify(
+            db, principal, approvals.change_approvers(db, principal, project, change), "approval",
+            f"{project.project_code} change request {change.cr_key} needs your decision",
+            body=f"{change.title} ({_impact_text(change)}). Raised by {principal.user_name}", link=link, project_id=project.id,
+        )
+    else:
+        notification_repo.notify(
+            db, principal, [(change.raised_by, change.raised_by_name)], "approval",
+            f"{change.cr_key} {change.title} was {decided.lower()}",
+            body=change.decision_note or change.applied_summary, link=link, project_id=project.id,
+        )
+
+
 def update_change(db, principal, project, change, data) -> ChangeRequest:
-    _open_project(project)
+    _changeable_project(project)
     if change.status != "Submitted":
         raise RiskError(f"{change.cr_key} is {change.status} and can no longer be edited")
+    if change.raised_by and change.raised_by != principal.user_id:
+        # Otherwise someone (an Admin too) could rewrite a request and then approve "someone else's" change.
+        raise RiskError(f"{change.cr_key} was raised by {change.raised_by_name or 'someone else'}; only they can edit it")
     milestone = _milestone(db, project, data.get("milestone_id"))
     if milestone:
         _check_milestone_changeable(db, milestone)
@@ -383,7 +469,9 @@ def update_change(db, principal, project, change, data) -> ChangeRequest:
 
 def decide_change(db, principal, project, change, approve: bool, note=None) -> ChangeRequest:
     """Approve (and apply the impact to the project) or reject a change request."""
-    _open_project(project)
+    _changeable_project(project)
+    # Two approvals at the same moment would both read the old budget and the last write would win.
+    _lock(db, project, change)
     if change.status != "Submitted":
         raise RiskError(f"{change.cr_key} is already {change.status}")
     if not principal.user_id:
@@ -409,12 +497,16 @@ def decide_change(db, principal, project, change, approve: bool, note=None) -> C
                 new_amount = Decimal(milestone.amount or 0) + cost
                 if new_amount < 0:
                     raise RiskError(f"'{milestone.name}' would go below zero ({float(new_amount):,.2f})")
+                if new_amount > MAX_MILESTONE_AMOUNT:
+                    raise RiskError(f"'{milestone.name}' would become {float(new_amount):,.2f}, above the largest amount allowed ({float(MAX_MILESTONE_AMOUNT):,.2f})")
                 milestone.amount = new_amount
                 applied.append(f"Milestone '{milestone.name}' amount {'+' if cost > 0 else ''}{float(cost):,.2f}")
             else:
                 new_budget = Decimal(project.budget or 0) + cost
                 if new_budget < 0:
                     raise RiskError(f"The budget would go below zero ({float(new_budget):,.2f})")
+                if new_budget > MAX_BUDGET:
+                    raise RiskError(f"The budget would become {float(new_budget):,.2f}, above the largest budget allowed ({float(MAX_BUDGET):,.2f})")
                 project.budget = new_budget
                 applied.append(f"Budget {'+' if cost > 0 else ''}{float(cost):,.2f}")
         if change.days_impact:
@@ -423,6 +515,18 @@ def decide_change(db, principal, project, change, approve: bool, note=None) -> C
             new_end = project.end_date + timedelta(days=change.days_impact)
             if project.start_date and new_end < project.start_date:
                 raise RiskError("The new end date would be before the project start")
+            if change.days_impact < 0:
+                # A shorter project must still hold its open milestones and tasks.
+                late_m = db.query(Milestone).filter(Milestone.project_id == project.id, Milestone.is_deleted == False,  # noqa: E712
+                                                    Milestone.status != "Accepted", Milestone.due_date > new_end).first()
+                if late_m:
+                    raise RiskError(f"Milestone '{late_m.name}' is due {late_m.due_date.strftime('%d %b %Y')}, after the new end date "
+                                    f"{new_end.strftime('%d %b %Y')}. Move it first")
+                late_t = db.query(Task).filter(Task.project_id == project.id, Task.is_deleted == False,  # noqa: E712
+                                               Task.status != "Done", Task.due_date > new_end).first()
+                if late_t:
+                    raise RiskError(f"Task {late_t.task_key} is due {late_t.due_date.strftime('%d %b %Y')}, after the new end date "
+                                    f"{new_end.strftime('%d %b %Y')}. Move it first")
             project.end_date = new_end
             applied.append(f"End date {'+' if change.days_impact > 0 else ''}{change.days_impact} days -> {new_end.strftime('%d %b %Y')}")
     change.status = "Approved" if approve else "Rejected"
@@ -430,14 +534,17 @@ def decide_change(db, principal, project, change, approve: bool, note=None) -> C
     change.decided_by, change.decided_by_name, change.decided_at = principal.user_id, principal.user_name, _utcnow()
     change.applied_summary = "; ".join(applied) or ("No automatic changes (scope only)" if approve else None)
     approvals.log(db, principal, "change", change.id, change.status, project_id=project.id, remarks=note)
+    _notify_change(db, principal, project, change, change.status)
     db.commit()
     db.refresh(change)
     return change
 
 
 def withdraw_change(db, principal, project, change) -> None:
+    _open_project(project)
     if change.status != "Submitted":
         raise RiskError(f"{change.cr_key} is {change.status} and stays on record")
+    # Only the requester withdraws (go-live security fix of 2 Oct 2026, tests/api_security_fixes.py).
     if change.raised_by and change.raised_by != principal.user_id and not principal.is_superadmin:
         raise RiskError(f"{change.cr_key} was raised by {change.raised_by_name or 'someone else'}; only they can withdraw it")
     change.is_deleted = True

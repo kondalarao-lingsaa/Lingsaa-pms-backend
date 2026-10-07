@@ -133,7 +133,8 @@ def portal_milestone_decision(
     who = notification_repo.person_name(principal.user_name) or principal.user_name
     notification_repo.notify(
         db, principal, [(project.project_manager_id, project.project_manager_name)], "approval",
-        f"{who} ({project.customer_name}) {'accepted' if new_status == 'Accepted' else 'asked for changes on'} '{milestone.name}'",
+        f"{who} ({project.customer_name}) {'accepted' if new_status == 'Accepted' else 'asked for changes on'} '{milestone.name}' "
+        f"of {project.project_code} {project.project_name}",
         body=body.feedback, link=f"projects/projectDetails/?id={project.id}&tab=milestones", project_id=project.id,
     )
     db.commit()

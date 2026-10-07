@@ -4,7 +4,7 @@ from app.db.base import Base
 from app.models.roles import SCHEMA
 
 # What happened, as shown by the bell icon and the Communication screens.
-NOTIFICATION_KINDS = ["mention", "comment", "assigned", "status", "timesheet", "expense", "approval", "message", "reminder"]
+NOTIFICATION_KINDS = ["mention", "comment", "assigned", "status", "timesheet", "expense", "approval", "message", "reminder", "report", "automation"]
 
 
 class Notification(Base):

@@ -1,6 +1,6 @@
 """Invoices: per accepted milestone (fixed price) or from approved, not yet billed hours (time & material)."""
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import or_, text
@@ -17,6 +17,7 @@ from app.schemas.billing import invoice_out
 from app.core.access import project_scope
 
 NOT_BILLABLE_TYPES = ("Internal",)
+HOURS_NOT_BILLED_TYPES = ("Fixed Price",)  # billed by milestone; hours would be charged twice
 CENT = Decimal("0.01")
 
 
@@ -57,9 +58,11 @@ def _next_invoice_no(db, client_id) -> str:
 
 
 def _unbilled_hours(db, project_id, period_from=None, period_to=None):
-    """Approved hours of live tasks not on any active invoice yet."""
+    """Approved hours of live tasks not on any active invoice yet, as (entry, role, price per hour, priced at cost).
+
+    The price is the member's billing rate; a member without one is billed at the cost rate locked on the entry."""
     query = (
-        db.query(TimeEntry, ProjectMember.role)
+        db.query(TimeEntry, ProjectMember.role, ProjectMember.bill_rate)
         .join(Task, Task.id == TimeEntry.task_id)
         .join(ProjectMember, ProjectMember.id == TimeEntry.member_id)
         .filter(
@@ -74,7 +77,7 @@ def _unbilled_hours(db, project_id, period_from=None, period_to=None):
         query = query.filter(TimeEntry.work_date >= period_from)
     if period_to:
         query = query.filter(TimeEntry.work_date <= period_to)
-    return query.order_by(TimeEntry.work_date).all()
+    return [(e, role, bill if bill is not None else e.hourly_rate, bill is None) for e, role, bill in query.order_by(TimeEntry.work_date).all()]
 
 
 def _unbilled_expenses(db, project_id, period_from=None, period_to=None):
@@ -107,18 +110,22 @@ def billable_summary(db, principal, project) -> dict:
         for m in milestones
         if not _active_invoice_for_milestone(db, m.id)
     ]
-    hours = _unbilled_hours(db, project.id)
-    unrated = sorted({e.member_name for e, _ in hours if e.hourly_rate is None})
+    hours = [] if project.project_type in HOURS_NOT_BILLED_TYPES else _unbilled_hours(db, project.id)
+    unrated = sorted({e.member_name for e, _, price, _ in hours if price is None})
+    at_cost = sorted({e.member_name for e, _, price, cost in hours if cost and price is not None})
     expenses = _unbilled_expenses(db, project.id)
-    dates = [e.work_date for e, _ in hours] + [x.expense_date for x in expenses]
+    dates = [e.work_date for e, *_ in hours] + [x.expense_date for x in expenses]
     return {
         "billable": project.project_type not in NOT_BILLABLE_TYPES,
         "project_type": project.project_type,
+        "bills_hours": project.project_type not in HOURS_NOT_BILLED_TYPES,
         "customer_name": project.customer_name,
         "customer_gstin": project.customer_gstin,
         "milestones": ready,
-        "unbilled_hours": round(sum(float(e.hours) for e, _ in hours), 2),
-        "unbilled_amount": round(sum(float(e.hours) * float(e.hourly_rate) for e, _ in hours if e.hourly_rate is not None), 2),
+        "unbilled_hours": round(sum(float(e.hours) for e, *_ in hours), 2),
+        "unbilled_amount": round(sum(float(e.hours) * float(price) for e, _, price, _ in hours if price is not None), 2),
+        # People without a billing rate are billed at their cost rate (no margin): set their billing rate on the Team tab.
+        "billed_at_cost_members": at_cost,
         "unbilled_from": min(dates).isoformat() if dates else None,
         "unbilled_to": max(dates).isoformat() if dates else None,
         "unbilled_expenses": len(expenses),
@@ -155,20 +162,30 @@ def create_invoice(db, principal, project, data) -> Invoice:
             raise BillingError(f"'{milestone.name}' has no amount. Set its amount first")
         lines.append({"description": f"Milestone: {milestone.name}", "quantity": Decimal("1"), "unit": "item", "rate": _money(milestone.amount)})
     else:
-        rows = _unbilled_hours(db, project.id, data["period_from"], data["period_to"])
+        # A Fixed Price project's work is paid through its milestones, so its hours are never billed again by
+        # period - only its billable expenses (travel, hardware) can be.
+        fixed_price = project.project_type in HOURS_NOT_BILLED_TYPES
+        if fixed_price and not data.get("include_expenses", True):
+            raise BillingError(f"{project.project_code} is a Fixed Price project: its work is billed by milestone. "
+                               "A period invoice can only bill its billable expenses")
+        rows = [] if fixed_price else _unbilled_hours(db, project.id, data["period_from"], data["period_to"])
         expenses = _unbilled_expenses(db, project.id, data["period_from"], data["period_to"]) if data.get("include_expenses", True) else []
         if not rows and not expenses:
+            if fixed_price:
+                raise BillingError(f"{project.project_code} is a Fixed Price project: its work is billed by milestone, "
+                                   "and there are no billable expenses in this period")
             raise BillingError("There are no approved, unbilled hours or billable expenses in this period")
-        unrated = sorted({e.member_name for e, _ in rows if e.hourly_rate is None})
+        unrated = sorted({e.member_name for e, _, price, _ in rows if price is None})
         if unrated:
-            raise BillingError(f"Hours of {', '.join(unrated)} have no hourly rate. Set rates in Project > Team (they apply to newly approved hours)")
-        # One line per person and rate: "Anita Rao (Developer)  12.5 hrs x 800".
+            raise BillingError(f"Hours of {', '.join(unrated)} have no billing rate. Set it in Project > Team")
+        # One line per person and price: "Anita Rao (Developer)  12.5 hrs x 1,200" (the billing rate, never the pay rate
+        # when one is set).
         grouped = defaultdict(Decimal)
-        for e, role in rows:
-            grouped[(e.member_name, role, _money(e.hourly_rate))] += Decimal(e.hours)
+        for e, role, price, _ in rows:
+            grouped[(e.member_name, role, _money(price))] += Decimal(e.hours)
         for (name, role, rate), hours in sorted(grouped.items()):
             lines.append({"description": f"{name} ({role})", "quantity": hours, "unit": "hrs", "rate": rate})
-        entries = [e for e, _ in rows]
+        entries = [e for e, *_ in rows]
         # Billable expenses are charged at cost, one line each, so the client sees what they pay for.
         for x in expenses:
             lines.append({"description": f"Expense {x.expense_key}: {x.category} - {x.description}"[:500], "quantity": Decimal("1"), "unit": "item", "rate": _money(x.amount)})
@@ -211,10 +228,17 @@ def create_invoice(db, principal, project, data) -> Invoice:
 
 def change_status(db, principal, invoice, action, paid_date=None) -> Invoice:
     today = date.today()
+    # Lock the invoice row until commit and re-read it: a Pay and a Cancel sent at the same moment run one after
+    # the other, so the second one sees the first one's status and is refused.
+    db.execute(text("SELECT id FROM projectmanagement.invoices WITH (UPDLOCK, ROWLOCK) WHERE id = :i"), {"i": invoice.id})
+    db.refresh(invoice)
     if action == "issue":
         if invoice.status != "Draft":
             raise BillingError(f"{invoice.invoice_no} is {invoice.status}. Only Draft invoices can be issued")
-        terms = (invoice.due_date - invoice.created_at.date()).days if invoice.due_date and invoice.created_at else 30
+        # created_at is SQL Server's UTC clock while due_date was set from the local date: compare local dates,
+        # or a draft made after midnight IST would gain a day of terms.
+        drafted = invoice.created_at.replace(tzinfo=timezone.utc).astimezone().date() if invoice.created_at else None
+        terms = (invoice.due_date - drafted).days if invoice.due_date and drafted else 30
         invoice.issue_date = today
         invoice.due_date = today + timedelta(days=max(0, terms))
         invoice.status = "Issued"

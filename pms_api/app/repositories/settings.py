@@ -1,6 +1,7 @@
 """Company Settings: the working calendar (hours per day, working weekdays) and holidays."""
 from datetime import date
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.industries import DEFAULT_INDUSTRY, INDUSTRIES, preset
@@ -93,7 +94,12 @@ def add_holiday(db: Session, principal, holiday_date, name) -> Holiday:
         raise SettingsError(f"{holiday_date.strftime('%d %b %Y')} is already a holiday ({existing.name})")
     h = Holiday(client_id=principal.client_id, holiday_date=holiday_date, name=name, created_by=principal.user_id)
     db.add(h)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Someone else added the same date at the same moment (uq_holidays_client_date).
+        db.rollback()
+        raise SettingsError(f"{holiday_date.strftime('%d %b %Y')} is already a holiday")
     db.refresh(h)
     return h
 

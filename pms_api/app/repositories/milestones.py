@@ -5,6 +5,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.models.billing import Invoice
+from app.repositories import automation_jobs
 from app.models.milestones import MILESTONE_TRANSITIONS, Deliverable, Milestone
 from app.models.projects import Project
 from app.models.tasks import Task
@@ -93,9 +94,18 @@ def list_all(db, principal, *, project_id=None, status=None, search=None) -> lis
     return serialize(db, [m for m, _ in rows], {p.id: p for _, p in rows})
 
 
-def _check(db, principal, project, data, own_id=None):
-    if project.status == "Closed":
+def _not_closed(project):
+    if project is not None and project.status == "Closed":
         raise MilestoneError(f"{project.project_code} is Closed, so its milestones can no longer change")
+
+
+def _project_open(db, milestone):
+    """Status changes, deletes and deliverables follow the same Closed-project lock as create / edit."""
+    _not_closed(db.query(Project).filter(Project.id == milestone.project_id).one_or_none())
+
+
+def _check(db, principal, project, data, own_id=None):
+    _not_closed(project)
     dupe = _live(db, principal).filter(Milestone.project_id == project.id, func.lower(Milestone.name) == data["name"].lower())
     if own_id:
         dupe = dupe.filter(Milestone.id != own_id)
@@ -135,6 +145,7 @@ def update_milestone(db, principal, project, milestone, data) -> Milestone:
 
 def delete_milestone(db, principal, milestone) -> None:
     _unlocked(milestone)
+    _project_open(db, milestone)
     if _active_invoices(db, [milestone.id]):
         raise MilestoneError(f"'{milestone.name}' has an invoice. Cancel the invoice first")
     # Its tasks stay; they just no longer belong to a milestone.
@@ -144,19 +155,28 @@ def delete_milestone(db, principal, milestone) -> None:
     db.commit()
 
 
+def _check_complete(db, milestone, when):
+    """Every linked task and deliverable must be done - checked when sent for review and again when accepted,
+    because a task can be reopened or a deliverable added while the milestone waits for review."""
+    stats = _task_stats(db, [milestone.id]).get(milestone.id, {"total": 0, "done": 0})
+    deliverables = _deliverables(db, [milestone.id])[milestone.id]
+    if not stats["total"] and not deliverables:
+        raise MilestoneError(f"Link at least one task or add a deliverable before {when}")
+    open_tasks = stats["total"] - stats["done"]
+    open_deliverables = sum(1 for d in deliverables if not d.is_done)
+    if open_tasks or open_deliverables:
+        parts = [f"{open_tasks} task{'s' if open_tasks != 1 else ''}" if open_tasks else "", f"{open_deliverables} deliverable{'s' if open_deliverables != 1 else ''}" if open_deliverables else ""]
+        raise MilestoneError(f"Finish {' and '.join(p for p in parts if p)} first - everything must be done before {when}")
+
+
 def change_status(db, principal, milestone, new_status, feedback=None) -> Milestone:
+    _project_open(db, milestone)
     if new_status not in MILESTONE_TRANSITIONS.get(milestone.status, []):
         raise MilestoneError(f"A milestone that is {milestone.status} cannot move to {new_status}")
     if new_status == "Ready for Review":
-        stats = _task_stats(db, [milestone.id]).get(milestone.id, {"total": 0, "done": 0})
-        deliverables = _deliverables(db, [milestone.id])[milestone.id]
-        if not stats["total"] and not deliverables:
-            raise MilestoneError("Link at least one task or add a deliverable before sending this milestone for review")
-        open_tasks = stats["total"] - stats["done"]
-        open_deliverables = sum(1 for d in deliverables if not d.is_done)
-        if open_tasks or open_deliverables:
-            parts = [f"{open_tasks} task{'s' if open_tasks != 1 else ''}" if open_tasks else "", f"{open_deliverables} deliverable{'s' if open_deliverables != 1 else ''}" if open_deliverables else ""]
-            raise MilestoneError(f"Finish {' and '.join(p for p in parts if p)} first - everything must be done before review")
+        _check_complete(db, milestone, "sending this milestone for review")
+    if new_status == "Accepted":
+        _check_complete(db, milestone, "accepting this milestone")
     if new_status == "Changes Requested":
         if not feedback or len(feedback) < 5:
             raise MilestoneError("Please Enter Feedback (at least 5 characters) so the team knows what to change")
@@ -168,12 +188,15 @@ def change_status(db, principal, milestone, new_status, feedback=None) -> Milest
     milestone.status = new_status
     milestone.updated_by = principal.user_id
     db.commit()
+    if new_status == "Accepted":
+        automation_jobs.after_milestone_accepted(db, milestone)
     db.refresh(milestone)
     return milestone
 
 
 def add_deliverable(db, principal, milestone, name) -> Deliverable:
     _unlocked(milestone)
+    _project_open(db, milestone)
     exists = db.query(Deliverable).filter(Deliverable.milestone_id == milestone.id, Deliverable.is_deleted == False, func.lower(Deliverable.name) == name.lower()).first()  # noqa: E712
     if exists:
         raise MilestoneError(f"'{name}' is already a deliverable of this milestone")
@@ -193,15 +216,19 @@ def _deliverable(db, milestone, deliverable_id):
 
 def set_deliverable_done(db, principal, milestone, deliverable_id, is_done) -> None:
     _unlocked(milestone)
+    _project_open(db, milestone)
     item = _deliverable(db, milestone, deliverable_id)
     item.is_done = is_done
     item.done_at = _utcnow() if is_done else None
     item.done_by_name = principal.user_name if is_done else None
+    if is_done:
+        automation_jobs.after_deliverable_done(db, milestone, item.name)
     db.commit()
 
 
 def rename_deliverable(db, principal, milestone, deliverable_id, name) -> Deliverable:
     _unlocked(milestone)
+    _project_open(db, milestone)
     item = _deliverable(db, milestone, deliverable_id)
     clash = (
         db.query(Deliverable)
@@ -217,6 +244,7 @@ def rename_deliverable(db, principal, milestone, deliverable_id, name) -> Delive
 
 def delete_deliverable(db, principal, milestone, deliverable_id) -> None:
     _unlocked(milestone)
+    _project_open(db, milestone)
     _deliverable(db, milestone, deliverable_id).is_deleted = True
     db.commit()
 
@@ -233,6 +261,15 @@ def check_task_milestone(db, principal, project_id, milestone_id):
         raise MilestoneError("The milestone must belong to the same project")
     if milestone.status == "Accepted":
         raise MilestoneError(f"'{milestone.name}' is already Accepted, so no more tasks can be added to it")
+
+
+def check_task_leaves_milestone(db, principal, milestone_id):
+    """A task cannot be moved out of an Accepted milestone: the client signed off on exactly that work."""
+    if not milestone_id:
+        return
+    milestone = get_milestone(db, principal, milestone_id)
+    if milestone is not None and milestone.status == "Accepted":
+        raise MilestoneError(f"'{milestone.name}' is Accepted, so its tasks can no longer be moved to another milestone")
 
 
 def start_from_task(db, task) -> None:

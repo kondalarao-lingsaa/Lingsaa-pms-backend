@@ -28,6 +28,10 @@ class WorkloadError(Exception):
     """Bad filters; the message is safe to show to the user."""
 
 
+class ProjectNotFound(WorkloadError):
+    """The project filter names a project the caller cannot see (answered like /projects/{id}: 404)."""
+
+
 def _d(v):
     return v.isoformat() if v else None
 
@@ -52,23 +56,40 @@ def _live_tasks(db, principal):
     )
 
 
-def _members(db, principal, project_id=None):
-    """Team memberships on projects that still hold people's time, with the project's dates."""
+def _check_project(db, principal, project_id) -> None:
+    """A project filter must name a project the caller can see."""
+    if project_id and not (
+        db.query(Project.id)
+        .filter(Project.id == project_id, Project.client_id == principal.client_id, Project.is_deleted == False, project_scope(db, principal))  # noqa: E712
+        .first()
+    ):
+        raise ProjectNotFound("Project not found")
+
+
+def _members(db, principal, project_id=None, include_closed=False):
+    """Team memberships on projects the caller can see, with the project's dates. Forward-looking views skip
+    Closed projects (they no longer hold time); backward-looking ones keep them, so closing a project does not
+    change past numbers (its windows end when it was closed, see _member_window)."""
     query = (
         db.query(ProjectMember, Project)
         .join(Project, Project.id == ProjectMember.project_id)
         .filter(ProjectMember.client_id == principal.client_id, ProjectMember.is_deleted == False, Project.is_deleted == False,  # noqa: E712
-                Project.status.notin_(INACTIVE_PROJECT_STATUSES))
+                project_scope(db, principal))
     )
+    if not include_closed:
+        query = query.filter(Project.status.notin_(INACTIVE_PROJECT_STATUSES))
     if project_id:
         query = query.filter(Project.id == project_id)
     return query.all()
 
 
 def _member_window(m: ProjectMember, p: Project):
-    """The days a membership holds time: inside both the project's and the member's dates (open ends = unlimited)."""
+    """The days a membership holds time: inside both the project's and the member's dates (open ends = unlimited).
+    A Closed project stops holding time on the day it was closed (it cannot be edited afterwards)."""
     starts = [d for d in (p.start_date, m.start_date) if d]
     ends = [d for d in (p.end_date, m.end_date) if d]
+    if p.status in INACTIVE_PROJECT_STATUSES and p.updated_at:
+        ends.append(p.updated_at.date())
     return (max(starts) if starts else date.min), (min(ends) if ends else date.max)
 
 
@@ -167,13 +188,15 @@ def capacity(db: Session, principal, start=None, weeks=8, project_id=None) -> di
     week_starts = [first + timedelta(weeks=i) for i in range(weeks)]
     last = week_starts[-1] + timedelta(days=6)
 
+    _check_project(db, principal, project_id)
     cal = work_calendar.for_client(db, principal.client_id)
     people, by_name = _people(_members(db, principal, project_id))
     for p in people.values():
         p["weeks"] = [{"available": _available(cal, p, w, w + timedelta(days=6)), "planned": 0.0} for w in week_starts]
         p["tasks"], p["unscheduled_hours"], p["unestimated"] = [], 0.0, 0
 
-    query = _live_tasks(db, principal).filter(Task.status != "Done")
+    # Open work of Closed projects no longer needs anyone's time.
+    query = _live_tasks(db, principal).filter(Task.status != "Done", Project.status.notin_(INACTIVE_PROJECT_STATUSES))
     if project_id:
         query = query.filter(Task.project_id == project_id)
     unassigned = {"count": 0, "hours": 0.0}
@@ -237,12 +260,60 @@ def capacity(db: Session, principal, start=None, weeks=8, project_id=None) -> di
         "weeks": [{"index": i, "start": _d(w), "end": _d(w + timedelta(days=6)), "is_current": w <= today <= w + timedelta(days=6)} for i, w in enumerate(week_starts)],
         "people": rows,
         "unassigned": {"count": unassigned["count"], "hours": round(unassigned["hours"], 2)},
-        "range": {"from": _d(first), "to": _d(last)},
+        "range": {"from": _d(first), "to": _d(last), "hours_per_day": cal.hours_per_day},
         "summary": {
             "people": len(rows), "available": round(sum(r["available"] for r in rows), 2), "planned": round(sum(r["planned"] for r in rows), 2),
             "overloaded": sum(1 for r in rows if r["over_weeks"]),
         },
     }
+
+
+def suggest_assignees(db: Session, principal, project_id, start=None, due=None, hours=None) -> dict:
+    """Who on the project's team has the most free time for a task (start..due; two weeks when undated).
+
+    Free time = hours their allocations give minus open work already planned for them, counted across every
+    project (not only the ones the caller sees), so a person busy elsewhere is not suggested."""
+    from app.repositories.automation import system_principal  # local import: automation reads this module's neighbours
+
+    _check_project(db, principal, project_id)
+    today = date.today()
+    first = max(start or today, today)
+    last = due if due and due >= first else first + timedelta(days=13)
+    weeks = max(1, min(MAX_CAPACITY_WEEKS, (_monday(last) - _monday(today)).days // 7 + 1))
+    cal = work_calendar.for_client(db, principal.client_id)
+    cap = capacity(db, system_principal(principal.client_id), start=today, weeks=weeks)
+    load = {r["key"]: r for r in cap["people"]}
+    share = []
+    for w in cap["weeks"]:
+        ws, we = date.fromisoformat(w["start"]), date.fromisoformat(w["end"])
+        all_days = cal.count(ws, we)
+        share.append(cal.count(max(ws, first), min(we, last)) / all_days if all_days else 0)
+    team = (
+        db.query(ProjectMember)
+        .filter(ProjectMember.project_id == project_id, ProjectMember.client_id == principal.client_id, ProjectMember.is_deleted == False)  # noqa: E712
+        .all()
+    )
+    open_tasks = defaultdict(int)
+    for t, _ in _live_tasks(db, system_principal(principal.client_id)).filter(Task.status != "Done"):
+        open_tasks[f"u{t.assignee_id}" if t.assignee_id else f"n{(t.assignee_name or '').strip().lower()}"] += 1
+    people = []
+    for m in team:
+        key = _person_key(m.user_id, m.member_name)
+        row = load.get(key)
+        available = planned = 0.0
+        if row:
+            for i, w in enumerate(row["weeks"]):
+                available += w["available"] * share[i]
+                planned += w["planned"] * share[i]
+        free = max(0.0, available - planned)
+        people.append({
+            "member_id": m.id, "user_id": m.user_id, "member_name": m.member_name, "role": m.role,
+            "free_hours": round(free, 1), "available_hours": round(available, 1), "planned_hours": round(planned, 1),
+            "load_pct": round(planned / available * 100) if available else None,
+            "open_tasks": open_tasks[key], "fits": hours is None or free >= float(hours),
+        })
+    people.sort(key=lambda p: (-p["free_hours"], p["open_tasks"], p["member_name"].lower()))
+    return {"from": _d(first), "to": _d(last), "hours": float(hours) if hours is not None else None, "people": people}
 
 
 def _state(available, planned):
@@ -273,8 +344,12 @@ def utilization(db: Session, principal, start=None, end=None, project_id=None, p
         week_starts.append(w)
         w += timedelta(weeks=1)
 
+    _check_project(db, principal, project_id)
     cal = work_calendar.for_client(db, principal.client_id)
-    people, by_name = _people(_members(db, principal, project_id))
+    # Closed projects count only for the days they were still running inside this period.
+    memberships = [(m, p) for m, p in _members(db, principal, project_id, include_closed=True)
+                   if p.status not in INACTIVE_PROJECT_STATUSES or (_member_window(m, p)[0] <= end and _member_window(m, p)[1] >= start)]
+    people, by_name = _people(memberships)
     for p in people.values():
         p["weeks"] = [{"available": _available(cal, p, max(ws, start), min(ws + timedelta(days=6), end)), "approved": 0.0, "pending": 0.0} for ws in week_starts]
         p["approved"] = p["pending"] = p["billable"] = 0.0
@@ -284,7 +359,7 @@ def utilization(db: Session, principal, start=None, end=None, project_id=None, p
         .join(Task, Task.id == TimeEntry.task_id)
         .join(Project, Project.id == TimeEntry.project_id)
         .filter(TimeEntry.client_id == principal.client_id, TimeEntry.is_deleted == False, Task.is_deleted == False, Project.is_deleted == False,  # noqa: E712
-                TimeEntry.status.in_(("Approved", "Submitted")), TimeEntry.work_date >= start, TimeEntry.work_date <= end)
+                project_scope(db, principal), TimeEntry.status.in_(("Approved", "Submitted")), TimeEntry.work_date >= start, TimeEntry.work_date <= end)
     )
     if project_id:
         entries = entries.filter(TimeEntry.project_id == project_id)

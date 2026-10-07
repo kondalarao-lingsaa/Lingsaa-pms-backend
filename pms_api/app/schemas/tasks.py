@@ -24,6 +24,8 @@ class TaskIn(BaseModel):
     estimated_hours: Optional[Decimal] = Field(default=None, ge=0, le=999.99, max_digits=8, decimal_places=2)
     actual_hours: Optional[Decimal] = Field(default=None, ge=0, le=999.99, max_digits=8, decimal_places=2)
     labels: List[str] = []
+    # Edit only: the task's updated_at when the form was loaded, so a save cannot silently undo a change made meanwhile.
+    updated_at: Optional[str] = Field(default=None, max_length=40)
 
     @field_validator("title")
     @classmethod

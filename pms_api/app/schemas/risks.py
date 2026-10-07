@@ -117,7 +117,7 @@ class ChangeRequestIn(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=2000)
     change_type: str
-    cost_impact: Optional[Decimal] = Field(default=None, ge=Decimal("-999999999999"), le=Decimal("999999999999"), max_digits=14, decimal_places=2)
+    cost_impact: Optional[Decimal] = Field(default=None, ge=Decimal("-999999999999.99"), le=Decimal("999999999999.99"), max_digits=14, decimal_places=2)
     days_impact: Optional[int] = Field(default=None, ge=-365, le=730)
     milestone_id: Optional[int] = None
 
@@ -184,7 +184,8 @@ def issue_out(i, *, project=None, task=None, risk_key=None) -> dict:
         "title": i.title, "description": i.description, "severity": i.severity, "status": i.status,
         "next_statuses": ISSUE_TRANSITIONS.get(i.status, []), "owner_member_id": i.owner_member_id, "owner_name": i.owner_name,
         "due_date": _d(i.due_date), "is_overdue": bool(i.due_date and i.due_date < date.today() and i.status in ("Open", "In Progress")),
-        "risk_id": i.risk_id, "risk_key": risk_key, "task_id": i.task_id,
+        # A deleted fix task no longer counts, so a new one can be created.
+        "risk_id": i.risk_id, "risk_key": risk_key, "task_id": task.id if task else None,
         "task_key": task.task_key if task else None, "task_status": task.status if task else None,
         "resolution": i.resolution, "resolved_at": utc_iso(i.resolved_at), "raised_by_name": i.raised_by_name, "created_at": utc_iso(i.created_at),
     }

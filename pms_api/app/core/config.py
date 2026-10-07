@@ -25,9 +25,11 @@ class Settings(BaseSettings):
 
     JWT_SECRET: str = ""
     JWT_ALGORITHM: str = "HS256"
-    # Local-dev shortcuts until the MASTER service's token secret and claim names are confirmed.
-    JWT_ENFORCE_SIGNATURE: bool = False
-    ALLOW_TENANT_FROM_QUERY: bool = True
+    # Login tokens must carry a valid signature and their own company/user. Local development only may switch these
+    # off (JWT_ENFORCE_SIGNATURE=false / ALLOW_TENANT_FROM_QUERY=true in .env) until the MASTER login is connected:
+    # with the signature unchecked anyone can write a token for any company and user.
+    JWT_ENFORCE_SIGNATURE: bool = True
+    ALLOW_TENANT_FROM_QUERY: bool = False
     # The PMS's own email + password login (until the MASTER login is connected) and how long a login lasts.
     DEMO_LOGIN_ENABLED: bool = True
     LOGIN_HOURS: int = 12
@@ -41,7 +43,7 @@ class Settings(BaseSettings):
 
     # Email alerts (app/core/mailer.py). Without SMTP_HOST, emails are saved as files in MAIL_OUTBOX_DIR.
     EMAIL_ALERTS_ENABLED: bool = True
-    EMAIL_ALERT_KINDS: str = "approval,message,mention,assigned,timesheet,expense,reminder"
+    EMAIL_ALERT_KINDS: str = "approval,message,mention,assigned,timesheet,expense,reminder,report,automation"
     SMTP_HOST: str = ""
     SMTP_PORT: int = 587
     SMTP_USER: str = ""
@@ -51,6 +53,12 @@ class Settings(BaseSettings):
     MAIL_OUTBOX_DIR: str = "storage/outbox"
     # Where links in emails point (the web app's address).
     APP_BASE_URL: str = "http://localhost:3000"
+
+    # Automation (Settings > Automation): a background thread runs each company's scheduled jobs (reminders,
+    # reports, invoices, recurring tasks) at their set time. Switch it off on a second copy of the API
+    # (tests, a reporting replica) so jobs run on one server only; "Run now" still works there.
+    AUTOMATION_ENABLED: bool = True
+    AUTOMATION_TICK_SECONDS: int = 60
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -73,6 +81,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _safe_for_production(self):
+        # A typo such as "prod" or "staging" must not quietly skip the production checks below.
+        if self.ENVIRONMENT.lower() not in ("development", "production"):
+            raise ValueError("ENVIRONMENT must be development or production")
+        # Checking signatures against an empty secret would accept tokens anyone can sign.
+        if self.JWT_ENFORCE_SIGNATURE and not self.JWT_SECRET:
+            raise ValueError("JWT_SECRET must be set (or, for local development only, JWT_ENFORCE_SIGNATURE=false)")
         if self.is_production:
             problems = []
             if not self.JWT_SECRET:

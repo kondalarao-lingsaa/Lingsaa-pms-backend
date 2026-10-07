@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from app.core.access import can_see_rates
 from app.core.security import Principal, get_current_principal
 from app.db.session import get_db
 from app.models.timesheets import ENTRY_STATUSES
@@ -61,16 +62,35 @@ def list_entries(
     db: Session = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ):
+    # A typo in a filter should say so, not quietly show an empty list.
+    if status and status not in ENTRY_STATUSES:
+        raise HTTPException(status_code=422, detail=f"Status must be one of: {', '.join(ENTRY_STATUSES)}")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="'From' date is after the 'To' date")
     rows, total, totals = repo.list_entries(
         db, principal, page=offset // page_size + 1, page_size=page_size, project_id=project_id, member=member,
         status=status, date_from=date_from, date_to=date_to,
     )
+    if not can_see_rates(principal):
+        _hide_money(rows)
+        totals["cost"] = None
     return {"detail": rows, "stack_values": {"count_pg": total, **totals}}
+
+
+def _hide_money(entries):
+    """Pay rates and costs are money: only roles that see the budget see them."""
+    for e in entries:
+        e["hourly_rate"] = None
+        e["cost"] = None
 
 
 @router.get("/timesheets/approvals")
 def approvals(project_id: Optional[int] = None, db: Session = Depends(get_db), principal: Principal = Depends(get_current_principal)):
     groups = repo.approval_queue(db, principal, project_id)
+    if not can_see_rates(principal):
+        for g in groups:
+            _hide_money(g["entries"])
+            g["cost"] = None
     return {"detail": groups, "stack_values": {"count_pg": len(groups), "hours": round(sum(g["hours"] for g in groups), 2)}}
 
 
@@ -100,9 +120,10 @@ def budget_overview(db: Session = Depends(get_db), principal: Principal = Depend
     """Every live project's budget against the cost of its approved hours."""
     projects = project_repo.all_projects(db, principal)
     progress = project_repo.progress_for(db, [p.id for p in projects])
+    budgets = repo.project_budgets(db, principal, projects, progress)
     rows = []
     for p in projects:
-        b = repo.project_budget(db, principal, p, progress.get(p.id, {}).get("progress", 0))
+        b = budgets[p.id]
         rows.append({
             "project_id": p.id, "project_code": p.project_code, "project_name": p.project_name, "status": p.status,
             "budget": b["budget"], "actual_cost": b["actual_cost"], "pending_cost": b["pending_cost"], "remaining": b["remaining"],

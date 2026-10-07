@@ -39,8 +39,9 @@ def decode_token(token: str) -> dict:
     except JWTError as exc:
         if settings.JWT_ENFORCE_SIGNATURE:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
-        # TEMPORARY (local dev): the MASTER service's signing secret is not confirmed yet.
-        # Accept the token unverified and log it, so a wrong secret cannot log users out of the whole app.
+        # LOCAL DEVELOPMENT ONLY (opt-in with JWT_ENFORCE_SIGNATURE=false; refused in production): the MASTER
+        # service's signing secret is not confirmed yet, so its tokens are accepted unverified. Anyone can then
+        # write a token for any company and user - never switch this on for a server others can reach.
         claims = jwt.get_unverified_claims(token)
         _report(verified=False, claims=claims)
         return claims

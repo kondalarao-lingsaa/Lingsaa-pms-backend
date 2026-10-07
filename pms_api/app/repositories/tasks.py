@@ -6,18 +6,26 @@ from sqlalchemy.orm import Session
 from app.core.security import Principal
 from app.models.projects import Project
 from app.models.tasks import TASK_STATUSES, Task, TaskLabel
+from app.models.team import ProjectMember
 from app.models.milestones import Milestone
 from app.models.sprints import Sprint
+from app.repositories import automation_jobs
 from app.repositories import milestones as milestone_repo
 from app.repositories import notifications as notification_repo
+from app.repositories import planning as planning_repo
 from app.repositories import team as team_repo
 from app.repositories.task_activity import blocked_message, log_activity, open_blockers
+from app.schemas.rules import utc_iso
 from app.schemas.tasks import task_out
 from app.core.access import project_scope
 
 
 class TaskError(Exception):
     """A rule of the task workflow was broken; the message is safe to show to the user."""
+
+
+class TaskConflict(TaskError):
+    """The task changed after the form was loaded (answered with 409)."""
 
 
 PRIORITY_RANK = case({"Critical": 0, "High": 1, "Medium": 2, "Low": 3}, value=Task.priority, else_=4)
@@ -190,11 +198,24 @@ def _check_parent(db, principal, project_id, parent_task_id, own_id=None):
 
 
 def _apply_assignee(db, principal, project_id, data):
-    """Tasks go to members of the project's team; the member's login user id is filled in so My Tasks works."""
+    """Tasks go to members of the project's team; the member's login user id is filled in so My Tasks works.
+    The stored user id is always the member's own (None for a member without a login), never the caller's."""
+    sent_id, sent_name = data.get("assignee_id"), data.get("assignee_name")
     try:
-        data["assignee_id"], data["assignee_name"] = team_repo.resolve_assignee(db, principal, project_id, data.get("assignee_name"), data.get("assignee_id"))
+        # Refuses anyone who is not on the team at all.
+        team_repo.resolve_assignee(db, principal, project_id, sent_name, sent_id)
     except team_repo.TeamError as exc:
         raise TaskError(str(exc)) from exc
+    if not sent_name and not sent_id:
+        data["assignee_id"], data["assignee_name"] = None, None
+        return
+    team = team_repo._live_members(db, principal).filter(ProjectMember.project_id == project_id)
+    member = team.filter(ProjectMember.user_id == sent_id).first() if sent_id else None
+    if member is None and sent_name:
+        member = team.filter(func.lower(ProjectMember.member_name) == sent_name.lower()).first()
+    if member is None or (sent_id and member.user_id != sent_id):
+        raise TaskError(f"{sent_name or 'This person'} is not in this project's team. Pick the assignee from the project's team.")
+    data["assignee_id"], data["assignee_name"] = member.user_id, member.member_name
 
 
 def _check_milestone(db, principal, project_id, milestone_id):
@@ -232,11 +253,21 @@ def _ensure_open(db, project_id=None, project=None):
         raise TaskError(f"{project.project_code} is Closed, so its tasks can no longer change")
 
 
+def _check_schedule(db, project, task_key, data, task_id=None):
+    """Task dates follow the same plan rules as the timeline (project dates, blockers, waiting tasks)."""
+    try:
+        planning_repo.check_dates(db, project, task_key, data.get("start_date"), data.get("due_date"), task_id=task_id, status=data.get("status"))
+    except planning_repo.PlanningError as exc:
+        raise TaskError(str(exc)) from exc
+
+
 def create_task(db, principal, data: dict) -> Task:
     project = _get_project(db, principal, data["project_id"])
     if project is None:
         raise TaskError("Project not found")
     _ensure_open(db, project=project)
+    data.pop("updated_at", None)  # only used when editing
+    _check_schedule(db, project, "The task", data)
     parent = _check_parent(db, principal, project.id, data.get("parent_task_id"))
 
     labels = data.pop("labels", [])
@@ -268,6 +299,9 @@ def create_task(db, principal, data: dict) -> Task:
 
 def update_task(db, principal, task: Task, data: dict) -> Task:
     _ensure_open(db, task.project_id)
+    loaded = data.pop("updated_at", None)
+    if loaded and loaded != utc_iso(task.updated_at):
+        raise TaskConflict(f"{task.task_key} was changed by someone else after you opened it. Close and open it again to see the latest version")
     if data["project_id"] != task.project_id:
         raise TaskError("A task cannot be moved to another project")
     data.pop("project_id")
@@ -290,8 +324,18 @@ def update_task(db, principal, task: Task, data: dict) -> Task:
         if blockers:
             raise TaskError(blocked_message(blockers))
 
+    # Only changed dates are checked, so a task planned before the rules (or the project dates) changed can still be edited.
+    if data.get("start_date") != task.start_date or data.get("due_date") != task.due_date:
+        project = db.query(Project).filter(Project.id == task.project_id).one()
+        _check_schedule(db, project, task.task_key, data, task_id=task.id)
+
     data.pop("actual_hours", None)  # filled from approved timesheets
     if data.get("milestone_id") != task.milestone_id:
+        try:
+            # The client signed off on an Accepted milestone's work: its tasks stay where they are.
+            milestone_repo.check_task_leaves_milestone(db, principal, task.milestone_id)
+        except milestone_repo.MilestoneError as exc:
+            raise TaskError(str(exc)) from exc
         _check_milestone(db, principal, task.project_id, data.get("milestone_id"))
     changes = _describe_changes(task, data)
     labels = data.pop("labels", [])
@@ -307,6 +351,7 @@ def update_task(db, principal, task: Task, data: dict) -> Task:
     if task.status != old_status:
         _notify_status(db, principal, task, old_status)
     milestone_repo.start_from_task(db, task)
+    automation_jobs.after_task_status(db, task, old_status)
     db.commit()
     db.refresh(task)
     return task
@@ -349,6 +394,7 @@ def change_status(db, principal, task: Task, new_status: str) -> Task:
     task.updated_by = principal.user_id
     _notify_status(db, principal, task, old_status)
     milestone_repo.start_from_task(db, task)
+    automation_jobs.after_task_status(db, task, old_status)
     db.commit()
     db.refresh(task)
     return task
@@ -356,6 +402,20 @@ def change_status(db, principal, task: Task, new_status: str) -> Task:
 
 def delete_task(db, principal, task: Task) -> None:
     _ensure_open(db, task.project_id)
+    # Submitted or approved hours are real cost (and maybe billed): deleting the task would drop them out of
+    # the budget, earned value and billing without a trace.
+    from app.models.timesheets import TimeEntry  # local import: timesheets reads the task model
+
+    subtask_ids = [t.id for t in db.query(Task.id).filter(Task.parent_task_id == task.id, Task.is_deleted == False)]  # noqa: E712
+    logged = (
+        db.query(func.coalesce(func.sum(TimeEntry.hours), 0))
+        .filter(TimeEntry.task_id.in_([task.id] + subtask_ids), TimeEntry.is_deleted == False,  # noqa: E712
+                TimeEntry.status.in_(("Submitted", "Approved")))
+        .scalar()
+    )
+    if logged:
+        raise TaskError(f"{task.task_key} has {float(logged):g} hours submitted or approved against it, so it cannot be deleted. "
+                        "Move it to Done instead")
     log_activity(db, principal, task.id, "deleted", "Task deleted")
     task.is_deleted = True
     task.updated_by = principal.user_id
@@ -406,31 +466,44 @@ def board(db, principal, *, project_id=None, mine=False, search=None, priority=N
 BOARD_GAP = 1024.0
 
 
-def _renumber_column(db, principal, status, project_id):
-    """Spreads a column's cards out again (1024 apart) when two neighbours have run out of room between them."""
+def _renumber_column(db, principal, status, project_id=None):
+    """Spreads a column's cards out again (1024 apart) when two neighbours have run out of room between them.
+    Without a project (neighbours from different projects on the All Projects board) the whole company's
+    column is renumbered, so the order every user sees stays the same."""
+    if project_id:
+        query = _scoped(db, principal).filter(Task.project_id == project_id)
+    else:
+        query = (
+            db.query(Task)
+            .join(Project, Project.id == Task.project_id)
+            .filter(Task.client_id == principal.client_id, Task.is_deleted == False, Project.is_deleted == False)  # noqa: E712
+        )
     cards = (
-        _scoped(db, principal)
-        .filter(Task.status == status, Task.project_id == project_id)
+        query.filter(Task.status == status)
         .order_by(Task.board_order.asc(), PRIORITY_RANK.asc(), Task.id.asc())
         .all()
     )
     for index, card in enumerate(cards, start=1):
         card.board_order = index * BOARD_GAP
+        card.updated_at = Task.updated_at  # housekeeping, not a change to the task: keeps its version (see update_task)
     db.flush()
 
 
 def move_task(db, principal, task: Task, new_status: str, prev_id=None, next_id=None) -> Task:
     """Drops a card into a column between two neighbours (either may be missing: top or bottom of the column)."""
     _ensure_open(db, task.project_id)
+    # Neighbours may belong to other projects: the All Projects board shows every project in one column,
+    # ordered by board_order.
     neighbours = {n.id: n for n in (get_task(db, principal, i) for i in (prev_id, next_id) if i) if n}
     for n in neighbours.values():
-        if n.project_id != task.project_id or n.status != new_status:
+        if n.status != new_status:
             neighbours = {}  # stale board: fall back to dropping at the bottom
             break
     prev_card, next_card = neighbours.get(prev_id), neighbours.get(next_id)
+    same_project = all(n.project_id == task.project_id for n in neighbours.values())
 
     if prev_card and next_card and next_card.board_order - prev_card.board_order < 1e-6:
-        _renumber_column(db, principal, new_status, task.project_id)
+        _renumber_column(db, principal, new_status, task.project_id if same_project else None)
 
     if prev_card and next_card:
         order = (prev_card.board_order + next_card.board_order) / 2
@@ -456,6 +529,7 @@ def move_task(db, principal, task: Task, new_status: str, prev_id=None, next_id=
         old_status, task.status = task.status, new_status
         _notify_status(db, principal, task, old_status)
         milestone_repo.start_from_task(db, task)
+        automation_jobs.after_task_status(db, task, old_status)
     task.board_order = order
     task.updated_by = principal.user_id
     db.commit()

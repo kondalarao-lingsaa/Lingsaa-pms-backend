@@ -16,11 +16,11 @@ Nobody approves their own request (checked where each item is decided).
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core import roles
-from app.core.access import allowed, project_scope
+from app.core.access import allowed, project_scope, visible_project_ids
 from app.models.access import ApprovalLog
 from app.models.expenses import Expense
 from app.models.milestones import Milestone
@@ -96,7 +96,9 @@ def log(db, principal, entity_type, entity_id, decision, project_id=None, level=
 def history(db: Session, principal, entity_type, entity_id) -> list:
     rows = (
         db.query(ApprovalLog)
-        .filter(ApprovalLog.client_id == principal.client_id, ApprovalLog.entity_type == entity_type, ApprovalLog.entity_id == entity_id)
+        .filter(ApprovalLog.client_id == principal.client_id, ApprovalLog.entity_type == entity_type, ApprovalLog.entity_id == entity_id,
+                # Only items on projects this person can see (every log row carries its project).
+                ApprovalLog.project_id.in_(visible_project_ids(db, principal)))
         .order_by(ApprovalLog.decided_at, ApprovalLog.id)
         .all()
     )
@@ -161,8 +163,13 @@ def _approvers(db, principal, level) -> list:
 
 
 def _level_signers(db, project_id) -> set:
+    # Only this round counts: after Send back and a new submission, earlier approvers may sign again.
+    last_submit = db.query(func.max(ApprovalLog.id)).filter(
+        ApprovalLog.entity_type == "project", ApprovalLog.entity_id == project_id, ApprovalLog.decision == "Submitted"
+    ).scalar() or 0
     rows = db.query(ApprovalLog.decided_by).filter(
-        ApprovalLog.entity_type == "project", ApprovalLog.entity_id == project_id, ApprovalLog.decision == "Approved", ApprovalLog.decided_by != None  # noqa: E711
+        ApprovalLog.entity_type == "project", ApprovalLog.entity_id == project_id, ApprovalLog.decision == "Approved", ApprovalLog.decided_by != None,  # noqa: E711
+        ApprovalLog.id > last_submit,
     ).all()
     return {r[0] for r in rows}
 
@@ -287,8 +294,29 @@ def send_back_project(db: Session, principal, project: Project, remarks=None) ->
 # ------------------------------------------------------------------------------ other items
 
 
+def _change_size(project, change) -> Decimal:
+    # The size of the change decides the level, whether it raises or cuts the budget. A budget change is also
+    # judged by how far the budget would then be from the approved baseline, so five small changes cannot add
+    # up to a raise that would have needed a Director.
+    cost = abs(Decimal(change.cost_impact or 0))
+    if change.cost_impact and not change.milestone_id and project.baseline_budget is not None:
+        drift = abs(Decimal(project.budget or 0) + Decimal(change.cost_impact) - Decimal(project.baseline_budget))
+        cost = max(cost, drift)
+    return cost
+
+
+def change_approvers(db, principal, project, change) -> list:
+    """Who is asked to decide a new change request: the project's manager, or the Directors/Admins above the limits."""
+    cost, lim = _change_size(project, change), limits(db, principal.client_id)
+    if cost > lim["high"]:
+        return _approvers(db, principal, 2)
+    if cost > lim["pm"]:
+        return _approvers(db, principal, 1)
+    return [(project.project_manager_id, project.project_manager_name)]
+
+
 def check_change_authority(db, principal, project, change) -> None:
-    cost = Decimal(change.cost_impact or 0)
+    cost = _change_size(project, change)
     lim = limits(db, principal.client_id)
     if cost > lim["high"]:
         if principal.role_key != roles.ADMIN:

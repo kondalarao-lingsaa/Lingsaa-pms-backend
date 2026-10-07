@@ -166,6 +166,13 @@ def remove_user(role_id: int, db: Session = Depends(get_db), principal: Principa
     row = _row(db, principal, role_id)
     _check_admin_left(db, principal, row, None, False)
     name = row.user_name
+    if row.role == roles.CLIENT:
+        # Without a row a person counts as an internal Member, so a Client is never deleted: their row stays with
+        # access off, which also ends any session they still have open.
+        row.is_active = False
+        row.updated_by = principal.user_id
+        db.commit()
+        return {"detail": f"{name}'s client access is switched off"}
     db.delete(row)
     db.commit()
     return {"detail": f"{name} removed. Without a role they are a Member"}
@@ -277,8 +284,9 @@ class LoginAsIn(BaseModel):
 @router.post("/dev/login-as")
 def login_as(body: LoginAsIn, db: Session = Depends(get_db), principal: Principal = Depends(get_current_principal)):
     """DEVELOPMENT ONLY: an Admin gets a login token for another user of the same company, to test each role.
-    Switched off in production and whenever real login checking is on."""
-    if settings.is_production or settings.JWT_ENFORCE_SIGNATURE:
+    Switched off in production. The token is signed with the PMS secret, so it also works with signature checking on
+    (the default); it gives an Admin nothing they could not do already by setting that user's password."""
+    if settings.is_production:
         raise HTTPException(status_code=404, detail="Not available")
     row = db.query(UserRole).filter(UserRole.client_id == principal.client_id, UserRole.user_id == body.user_id).one_or_none()
     if row is None:

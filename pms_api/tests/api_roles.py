@@ -140,7 +140,7 @@ try:
     ok("Approved budget cannot be edited directly (Change Request instead)", s == 409, r)
 
     # 6. visibility and rates
-    s, r = call("pm", "POST", f"/projects/{pid_mid}/members", {"member_name": "Anita Rao", "user_id": 5, "role": "Designer", "allocation_pct": 10,
+    s, r = call("pm", "POST", f"/projects/{pid_mid}/members", {"member_name": "Anita Rao", "user_id": 5, "role": "Designer", "allocation_pct": 0,
                                                                "hourly_rate": 600})
     ok("PM adds Anita (Member) to the team", s == 201, r)
     s, r = call("member", "GET", "/projects/list?page_size=100")
@@ -201,6 +201,20 @@ try:
     ok("Client cannot see their company's project while it is a Draft (404)", s == 404, s)
     s, r = call("member", "POST", f"/projects/{pid_mid}/milestones/{mid_ms}/status", {"status": "Accepted"})
     ok("Member cannot accept a milestone (403)", s == 403, s)
+    # A Director accepts for the client ("approve") but has no "edit" for other moves.
+    s, ms2 = call("pm", "POST", f"/projects/{pid_mid}/milestones", {"name": "Build Sign-off", "amount": 25000})
+    mid_ms2 = ms2["data"]["id"]
+    call("pm", "POST", f"/projects/{pid_mid}/milestones/{mid_ms2}/deliverables", {"name": "Build hand-over"})
+    s, r = call("pm", "GET", f"/projects/{pid_mid}/milestones")
+    d2 = next(m for m in r["detail"] if m["id"] == mid_ms2)["deliverables"][0]["id"]
+    call("pm", "POST", f"/projects/{pid_mid}/milestones/{mid_ms2}/deliverables/{d2}/done", {"is_done": True})
+    call("pm", "POST", f"/projects/{pid_mid}/milestones/{mid_ms2}/status", {"status": "In Progress"})
+    s, r = call("pm", "POST", f"/projects/{pid_mid}/milestones/{mid_ms2}/status", {"status": "Ready for Review"})
+    ok("PM sends a second milestone for review", s == 200, r)
+    s, r = call("director", "POST", f"/projects/{pid_mid}/milestones/{mid_ms2}/status", {"status": "In Progress"})
+    ok("Director cannot move a milestone back to In Progress (403)", s == 403, s)
+    s, r = call("director", "POST", f"/projects/{pid_mid}/milestones/{mid_ms2}/status", {"status": "Accepted", "feedback": "Accepted on the call"})
+    ok("Director accepts the milestone for the client", s == 200 and r["data"]["status"] == "Accepted", r)
 
     # 9. permission matrix (Settings > Roles & Permissions)
     s, r = call("member", "GET", "/billing/invoices")

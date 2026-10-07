@@ -29,7 +29,7 @@ def _invoice(db, principal, invoice_id):
 
 @router.get("/meta")
 def billing_meta(principal: Principal = Depends(get_current_principal)):
-    return {"detail": {"types": INVOICE_TYPES, "statuses": INVOICE_STATUSES, "tax_rates": [0, 5, 12, 18, 28], "payment_terms": [0, 7, 15, 30, 45, 60]}}
+    return {"detail": {"types": INVOICE_TYPES, "statuses": INVOICE_STATUSES, "tax_rates": [0, 5, 12, 18, 28], "payment_terms": [0, 7, 15, 30, 45, 60, 90]}}
 
 
 @router.get("/billable")

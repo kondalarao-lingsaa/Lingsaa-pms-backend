@@ -4,6 +4,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from app.models.projects import PROJECT_TYPES
 from app.models.tasks import TASK_PRIORITIES as PRIORITIES
 from app.models.tasks import TASK_TYPES
 from app.schemas.rules import capitalize_first, title_text
@@ -108,7 +109,8 @@ class TemplateTaskIn(BaseModel):
     description: Optional[str] = Field(default=None, max_length=4000)
     task_type: str = "Task"
     priority: str = "Medium"
-    estimated_hours: Optional[Decimal] = Field(default=None, ge=0, le=9999, max_digits=8, decimal_places=2)
+    # Same limit as a task (TaskIn), so tasks created from the template stay editable.
+    estimated_hours: Optional[Decimal] = Field(default=None, ge=0, le=999.99, max_digits=8, decimal_places=2)
     start_offset: Optional[int] = Field(default=None, ge=0, le=MAX_TEMPLATE_DAYS)
     duration_days: Optional[int] = Field(default=None, ge=1, le=MAX_TEMPLATE_DAYS)
     milestone_index: Optional[int] = Field(default=None, ge=0)
@@ -157,6 +159,15 @@ class TemplateIn(BaseModel):
     def _description(cls, v):
         return capitalize_first(v)
 
+    @field_validator("project_type")
+    @classmethod
+    def _type(cls, v):
+        # Checked here, not only when a project is made from the template, so a bad type never gets saved.
+        v = (v or "").strip() or None
+        if v and v not in PROJECT_TYPES:
+            raise ValueError(f"Project type must be one of: {', '.join(PROJECT_TYPES)}")
+        return v
+
     @model_validator(mode="after")
     def _plan(self):
         if not self.tasks and not self.milestones:
@@ -164,12 +175,14 @@ class TemplateIn(BaseModel):
         names = [m.name.lower() for m in self.milestones]
         if len(names) != len(set(names)):
             raise ValueError("Two milestones have the same name")
+        # Day 0 is the start date, so a project of N days runs from day 0 to day N-1 (its end date).
+        last = self.duration_days - 1
         for i, m in enumerate(self.milestones, start=1):
-            if m.due_offset is not None and m.due_offset > self.duration_days:
-                raise ValueError(f"Milestone {i} ({m.name}) is due on day {m.due_offset}, after the project length of {self.duration_days} days")
+            if m.due_offset is not None and m.due_offset > last:
+                raise ValueError(f"Milestone {i} ({m.name}) is due on day {m.due_offset}; a {self.duration_days}-day project ends on day {last}")
         for i, t in enumerate(self.tasks, start=1):
-            if t.start_offset is not None and t.start_offset + (t.duration_days or 1) - 1 > self.duration_days:
-                raise ValueError(f"Task {i} ({t.title}) ends after the project length of {self.duration_days} days")
+            if t.start_offset is not None and t.start_offset + (t.duration_days or 1) - 1 > last:
+                raise ValueError(f"Task {i} ({t.title}) ends after day {last}, the last day of a {self.duration_days}-day project")
             if t.milestone_index is not None and t.milestone_index >= len(self.milestones):
                 raise ValueError(f"Task {i} ({t.title}) points to a milestone that is not in the list")
             if t.parent_index is not None:

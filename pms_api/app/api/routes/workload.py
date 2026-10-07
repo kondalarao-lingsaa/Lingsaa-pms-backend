@@ -14,6 +14,8 @@ router = APIRouter(tags=["workload"])
 def _run(fn, *args, **kwargs):
     try:
         return {"detail": fn(*args, **kwargs)}
+    except repo.ProjectNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except repo.WorkloadError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -53,3 +55,15 @@ def resource_utilization(
     principal: Principal = Depends(get_current_principal),
 ):
     return _run(repo.utilization, db, principal, start=date_from, end=date_to, project_id=project_id, person=(person or "").strip() or None)
+
+
+@router.get("/projects/{project_id}/assignee-suggestions")
+def assignee_suggestions(
+    project_id: int,
+    start_date: Optional[date] = None,
+    due_date: Optional[date] = None,
+    hours: Optional[float] = Query(None, ge=0, le=999.99),
+    db: Session = Depends(get_db),
+    principal: Principal = Depends(get_current_principal),
+):
+    return _run(repo.suggest_assignees, db, principal, project_id, start=start_date, due=due_date, hours=hours)

@@ -75,7 +75,12 @@ def all_projects(db, principal) -> list:
     return _scoped(db, principal).order_by(Project.project_code).all()
 
 
-def get_project(db, principal, project_id):
+def get_project(db, principal, project_id, lock=False):
+    """lock=True holds the project row (UPDLOCK) until the request commits, so two status changes or approvals of
+    the same project at the same moment run one after the other and the second sees the first's result."""
+    if lock:
+        db.execute(text("SELECT id FROM projectmanagement.projects WITH (UPDLOCK, ROWLOCK) WHERE id = :id"), {"id": project_id})
+        return _scoped(db, principal).filter(Project.id == project_id).populate_existing().one_or_none()
     return _scoped(db, principal).filter(Project.id == project_id).one_or_none()
 
 
@@ -104,17 +109,42 @@ def _next_project_code(db: Session, client_id: int) -> str:
     return f"PRJ-{year}-{next_no:04d}"
 
 
+def _lock_names(db: Session, client_id: int) -> None:
+    """Holds the company's project counter (the same lock _next_project_code takes) until commit, so a name check
+    and the save that follows cannot interleave with another create or rename of the same company."""
+    db.execute(
+        text("SELECT last_no FROM projectmanagement.project_counters WITH (UPDLOCK, HOLDLOCK) WHERE client_id = :c AND year = :y"),
+        {"c": client_id, "y": date.today().year},
+    )
+
+
 def _ensure_unique_name(db, principal, name: str, own_id=None):
-    query = _scoped(db, principal).filter(func.lower(Project.project_name) == name.lower())
+    # Company-wide, not only the projects this person can see: names must not repeat in the company.
+    _lock_names(db, principal.client_id)
+    query = db.query(Project).filter(
+        Project.client_id == principal.client_id, Project.is_deleted == False, func.lower(Project.project_name) == name.lower()  # noqa: E712
+    )
     if own_id:
         query = query.filter(Project.id != own_id)
     if query.first() is not None:
         raise DuplicateProject(f"A project named '{name}' already exists")
 
 
+def _link_manager(db, principal, data: dict) -> None:
+    """The manager runs and sees the project through their login user id. A name typed without picking it from the
+    list still links when it is exactly one login user's name (otherwise the manager could not open the project)."""
+    if data.get("project_manager_id") or not (data.get("project_manager_name") or "").strip():
+        return
+    name = data["project_manager_name"].strip().lower()
+    matches = [p for p in team_repo.company_people(db, principal) if p["name"].strip().lower() == name]
+    if len(matches) == 1:
+        data["project_manager_id"] = matches[0]["user_id"]
+
+
 def create_project(db, principal, data: dict, commit=True) -> Project:
     """commit=False lets a caller (create from template) add milestones/tasks and commit everything at once."""
     _ensure_unique_name(db, principal, data["project_name"])
+    _link_manager(db, principal, data)
     project = Project(
         **data,
         client_id=principal.client_id,
@@ -134,6 +164,16 @@ def create_project(db, principal, data: dict, commit=True) -> Project:
 
 def update_project(db, principal, project: Project, data: dict) -> Project:
     _ensure_unique_name(db, principal, data["project_name"], own_id=project.id)
+    _link_manager(db, principal, data)
+    if (data.get("customer_name") or "").strip().lower() != (project.customer_name or "").strip().lower():
+        # The client portal finds invoices by the project's customer: renaming it would hand issued invoices
+        # to another client and hide them from the one they were sent to.
+        from app.models.billing import Invoice
+
+        sent = db.query(Invoice.invoice_no).filter(Invoice.project_id == project.id, Invoice.is_deleted == False,  # noqa: E712
+                                                   Invoice.status.in_(("Issued", "Paid"))).first()
+        if sent:
+            raise ProjectLocked(f"The client cannot be changed: invoice {sent[0]} was already issued to {project.customer_name}")
     for key, value in data.items():
         setattr(project, key, value)
     project.updated_by = principal.user_id
@@ -151,6 +191,61 @@ def delete_project(db, principal, project: Project) -> None:
 
 class InvalidTransition(Exception):
     pass
+
+
+class ProjectLocked(Exception):
+    """A change that would rewrite something already sent out (e.g. the client of an issued invoice)."""
+
+
+def reopen_project(db, principal, project: Project, reason: str) -> tuple:
+    """Closed -> Active, for a project closed by mistake. Only an Admin or Director may, always with a reason;
+    the reopening is kept in the approval history and the project manager is told."""
+    from app.core import roles
+    from app.repositories import approvals, notifications as notification_repo  # local import: both read the project model
+
+    if project.status != "Closed":
+        raise InvalidTransition(f"{project.project_code} is {project.status}. Only a Closed project can be reopened")
+    if getattr(principal, "role_key", None) not in (roles.ADMIN, roles.DIRECTOR):
+        raise InvalidTransition("Only an Admin or a Director can reopen a closed project")
+    project.status = "Active"
+    project.updated_by = principal.user_id
+    approvals.log(db, principal, "project", project.id, "Reopened", project_id=project.id, remarks=reason)
+    name = notification_repo.person_name(principal.user_name) or principal.user_name
+    notification_repo.notify(
+        db, principal, [(project.project_manager_id, project.project_manager_name), (project.approved_by, project.approved_by_name)], "approval",
+        f"{name} reopened {project.project_code} {project.project_name}", body=reason,
+        link=f"projects/projectDetails/?id={project.id}", project_id=project.id,
+    )
+    db.commit()
+    db.refresh(project)
+    return project, f"{project.project_code} is reopened and Active again"
+
+
+def close_blockers(db, project: Project) -> list:
+    """What still waits for a decision on a project. Once Closed nothing can change, so these would be stuck:
+    hours, expenses and change requests waiting for approval, and invoices still in Draft."""
+    from app.models.billing import Invoice
+    from app.models.expenses import Expense
+    from app.models.risks import ChangeRequest
+    from app.models.timesheets import TimeEntry
+
+    checks = [
+        (TimeEntry, TimeEntry.status == "Submitted", "timesheet entries waiting for approval"),
+        (Expense, Expense.status == "Submitted", "expenses waiting for approval"),
+        (ChangeRequest, ChangeRequest.status == "Submitted", "change requests waiting for a decision"),
+        (Invoice, Invoice.status == "Draft", "Draft invoices (issue or cancel them)"),
+    ]
+    found = []
+    for model, cond, label in checks:
+        n = db.query(func.count(model.id)).filter(model.project_id == project.id, model.is_deleted == False, cond).scalar()  # noqa: E712
+        if n:
+            found.append(f"{n} {label}" if n > 1 else f"1 {label.replace('entries', 'entry').replace('expenses', 'expense').replace('requests', 'request').replace('invoices', 'invoice')}")
+    # A running sprint would be left half done (its unfinished tasks never go back to the backlog).
+    from app.models.sprints import Sprint
+
+    for (name,) in db.query(Sprint.name).filter(Sprint.project_id == project.id, Sprint.is_deleted == False, Sprint.status == "Active"):  # noqa: E712
+        found.append(f"Sprint {name} is still active (complete it first)")
+    return found
 
 
 class DuplicateProject(Exception):
@@ -175,6 +270,10 @@ def change_status(db, principal, project: Project, new_status: str, remarks: str
         elif project.status == "Pending Approval" and new_status == "Draft":
             message = approvals.send_back_project(db, principal, project, remarks)
         else:
+            if new_status == "Closed":
+                blockers = close_blockers(db, project)
+                if blockers:
+                    raise InvalidTransition(f"{project.project_code} cannot be closed yet: {'; '.join(blockers)}")
             project.status = new_status
             message = f"{project.project_code} is now {new_status}"
     except approvals.ApprovalError as exc:

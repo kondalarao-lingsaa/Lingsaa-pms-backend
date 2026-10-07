@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from app.core import access
 from app.core.security import Principal, get_current_principal
 from app.db.session import get_db
 from app.repositories import projects as project_repo
@@ -152,5 +153,6 @@ def save_project_settings(project_id: int, body: ProjectSettingsIn, db: Session 
         raise HTTPException(status_code=404, detail="Project not found")
     if project.status == "Closed":
         raise HTTPException(status_code=409, detail=f"{project.project_code} is Closed, so its settings can no longer change")
+    access.require_runs_project(principal, project, "change this project's settings")
     data = project_settings_repo.save(db, principal, project, body.model_dump())
     return {"detail": f"Settings saved for {project.project_code}", "data": data}

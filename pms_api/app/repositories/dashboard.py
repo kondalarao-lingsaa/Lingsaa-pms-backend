@@ -129,10 +129,12 @@ def overview(db: Session, principal: Principal, project_id=None) -> dict:
     # ---- projects (health, progress, money)
     project_rows = []
     budget_planned = budget_actual = 0.0
+    # All projects' money in a few grouped queries (not a full Budget tab per project).
+    budgets = timesheet_repo.project_budgets(db, principal, projects, progress, with_revenue=True)
     for p in projects:
         pr = progress.get(p.id, {}).get("progress", 0)
         overdue = sum(1 for t in by_project[p.id] if t.due_date and t.due_date < today and t.status != "Done")
-        b = timesheet_repo.project_budget(db, principal, p, pr)
+        b = budgets[p.id]
         health, reason = _health(p, pr, overdue, b["health"], today, high_by_project[p.id])
         budget_planned += b["budget"] or 0
         budget_actual += b["actual_cost"]
@@ -170,10 +172,14 @@ def overview(db: Session, principal: Principal, project_id=None) -> dict:
             created[t.created_at.date() - timedelta(days=t.created_at.date().weekday())] += 1
     completed = defaultdict(int)
     task_ids = [t.id for t in tasks] or [-1]
-    for (when,) in (
-        db.query(TaskActivity.created_at)
-        .filter(TaskActivity.task_id.in_(task_ids), TaskActivity.action == "status", TaskActivity.detail.like("%-> Done%"), TaskActivity.created_at >= weeks[0])
+    # Done from the board / status menu is a "status" row ("To Do -> Done"); Done from the Edit Task form is part of
+    # an "updated" row ("Name: a -> b; Status: To Do -> Done; ...").
+    for when, action, detail in (
+        db.query(TaskActivity.created_at, TaskActivity.action, TaskActivity.detail)
+        .filter(TaskActivity.task_id.in_(task_ids), TaskActivity.action.in_(("status", "updated")), TaskActivity.detail.like("%-> Done%"), TaskActivity.created_at >= weeks[0])
     ):
+        if action == "updated" and not any(part.startswith("Status: ") and part.endswith("-> Done") for part in (detail or "").split("; ")):
+            continue
         completed[when.date() - timedelta(days=when.date().weekday())] += 1
     trend = [{"week": _week_label(w), "created": created[w], "completed": completed[w]} for w in weeks]
 

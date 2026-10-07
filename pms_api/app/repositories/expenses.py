@@ -52,7 +52,12 @@ def _serialize(db, rows) -> list:
     tasks = dict(db.query(Task.id, Task.task_key).filter(Task.id.in_({e.task_id for e in rows if e.task_id} or {-1})).all())
     invoices = dict(db.query(Invoice.id, Invoice.invoice_no).filter(Invoice.id.in_({e.invoice_id for e in rows if e.invoice_id} or {-1})).all())
     receipts = dict(db.query(Document.id, Document.file_name).filter(Document.id.in_({e.receipt_document_id for e in rows if e.receipt_document_id} or {-1}), Document.is_deleted == False).all())  # noqa: E712
-    return [expense_out(e, projects.get(e.project_id), milestones.get(e.milestone_id), tasks.get(e.task_id), invoices.get(e.invoice_id), receipts.get(e.receipt_document_id)) for e in rows]
+    out = [expense_out(e, projects.get(e.project_id), milestones.get(e.milestone_id), tasks.get(e.task_id), invoices.get(e.invoice_id), receipts.get(e.receipt_document_id)) for e in rows]
+    for row in out:
+        # A receipt deleted from the Documents page is gone: show the expense without one, so it can be attached again.
+        if row["receipt_document_id"] not in receipts:
+            row["receipt_document_id"] = None
+    return out
 
 
 def list_expenses(db, principal, *, project_id=None, status=None, category=None, search=None, mine=False, offset=0, limit=5):
@@ -71,7 +76,20 @@ def list_expenses(db, principal, *, project_id=None, status=None, category=None,
     query = base.filter(Expense.status == status) if status else base
     total = query.count()
     rows = query.order_by(Expense.expense_date.desc(), Expense.id.desc()).offset(offset).limit(limit).all()
-    return _serialize(db, rows), total, counts, {k: float(v) for k, v in sums.items()}
+    out = _serialize(db, rows)
+    # Whether this person may decide each waiting expense (the approval limits), so the screen offers Approve
+    # only where it would work - the same rule review() applies.
+    from app.repositories import approvals  # local import: approvals reads these models
+
+    for e, row in zip(rows, out):
+        can = e.status == "Submitted" and bool(principal.user_id) and e.spent_by != principal.user_id
+        if can:
+            try:
+                approvals.check_expense_authority(db, principal, [e])
+            except approvals.ApprovalError:
+                can = False
+        row["can_approve"] = can
+    return out, total, counts, {k: float(v) for k, v in sums.items()}
 
 
 def _check(db, principal, project, data):
@@ -130,17 +148,27 @@ def update_expense(db, principal, project, e: Expense, data: dict) -> Expense:
     return e
 
 
+def _has_receipt(db, e: Expense) -> bool:
+    # The receipt must still exist: one deleted from the Documents page no longer counts.
+    return bool(e.receipt_document_id) and db.query(Document.id).filter(
+        Document.id == e.receipt_document_id, Document.is_deleted == False  # noqa: E712
+    ).first() is not None
+
+
 def _check_receipt(db, project, e: Expense):
     limit = project_settings_repo.get(db, project.id)["receipt_required_above"]
-    if limit is not None and float(e.amount) > limit and not e.receipt_document_id:
+    if limit is not None and float(e.amount) > limit and not _has_receipt(db, e):
         raise ExpenseError(f"{project.project_code} needs a receipt for expenses above ₹{limit:,.0f}. Save it as a draft, attach the bill, then submit")
 
 
 def attach_receipt(db, principal, project, e: Expense, file_name, data) -> Expense:
-    """The bill is stored in Documents (category Receipt); a new upload becomes the next version of the old one."""
+    """The bill is stored in Documents (category Receipt); a new upload becomes the next version of the old one
+    (a fresh document when the old one was deleted from the Documents page)."""
     _own_editable(principal, e)
     doc = document_repo.save_upload(db, principal, project, file_name=file_name, data=data, title=f"Receipt {e.expense_key}", category="Receipt",
-                                    notes=f"{e.category}: {e.description}"[:1000], replaces_id=e.receipt_document_id)
+                                    notes=f"{e.category}: {e.description}"[:1000],
+                                    # On top of the newest live version (the expense may still point at an older or deleted one).
+                                    replaces_id=document_repo.latest_version_id(db, principal, e.receipt_document_id))
     e.receipt_document_id = doc.id
     db.commit()
     db.refresh(e)
@@ -186,6 +214,10 @@ def review(db, principal, ids, approve: bool, reason=None) -> dict:
         raise ExpenseError("Your login has no user id, so it cannot approve or reject. Please sign in again")
     if any(e.spent_by == principal.user_id for e in rows):
         raise ExpenseError("You cannot approve or reject your own expense. Another manager has to review it")
+    # A Closed project's cost is final.
+    closed = db.query(Project.project_code).filter(Project.id.in_({e.project_id for e in rows}), Project.status == "Closed").first()
+    if closed:
+        raise ExpenseError(f"{closed[0]} is Closed, so its expenses can no longer be approved or rejected")
     from app.repositories import approvals  # local import: approvals reads these models
 
     try:
@@ -220,23 +252,29 @@ def review(db, principal, ids, approve: bool, reason=None) -> dict:
 
 
 def totals(db, project_id) -> dict:
+    return totals_for(db, [project_id])[project_id]
+
+
+def totals_for(db, project_ids) -> dict:
+    """{project_id: approved / submitted / draft / billable approved amounts} in one grouped query."""
     rows = (
-        db.query(Expense.status, Expense.billable, func.coalesce(func.sum(Expense.amount), 0))
-        .filter(Expense.project_id == project_id, Expense.is_deleted == False)  # noqa: E712
-        .group_by(Expense.status, Expense.billable)
+        db.query(Expense.project_id, Expense.status, Expense.billable, func.coalesce(func.sum(Expense.amount), 0))
+        .filter(Expense.project_id.in_(list(project_ids) or [-1]), Expense.is_deleted == False)  # noqa: E712
+        .group_by(Expense.project_id, Expense.status, Expense.billable)
         .all()
     )
-    out = {"approved": 0.0, "submitted": 0.0, "draft": 0.0, "billable_approved": 0.0}
-    for status, billable, amount in rows:
+    out = {pid: {"approved": 0.0, "submitted": 0.0, "draft": 0.0, "billable_approved": 0.0} for pid in project_ids}
+    for pid, status, billable, amount in rows:
+        t = out[pid]
         if status == "Approved":
-            out["approved"] += float(amount)
+            t["approved"] += float(amount)
             if billable:
-                out["billable_approved"] += float(amount)
+                t["billable_approved"] += float(amount)
         elif status == "Submitted":
-            out["submitted"] += float(amount)
+            t["submitted"] += float(amount)
         elif status == "Draft":
-            out["draft"] += float(amount)
-    return {k: round(v, 2) for k, v in out.items()}
+            t["draft"] += float(amount)
+    return {pid: {k: round(v, 2) for k, v in t.items()} for pid, t in out.items()}
 
 
 # ------------------------------------------------------------------------------ actual cost
@@ -312,6 +350,8 @@ def actual_cost(db, principal, project_id=None, months=6) -> dict:
             "labour": labour_total, "expenses": expense_total, "total": round(labour_total + expense_total, 2),
             "pending_expenses": round(sum(r["pending_expenses"] for r in rows), 2),
             "budget": round(sum(r["budget"] for r in rows if r["budget"] is not None), 2),
+            # Cost of the projects that have a budget: compare this (not total) with budget for "Budget Used".
+            "budgeted_total": round(sum(r["total"] for r in rows if r["budget"] is not None), 2),
         },
     }
 
@@ -350,9 +390,10 @@ def variance(db, principal, project_id=None) -> dict:
         else:
             ev = round(bac * pr / 100, 2)
             pv = round(bac * planned_pct, 2) if planned_pct is not None else None
-            cpi = _ratio(ev, ac) if ac else None
+            cpi = _ratio(ev, ac) if ac else None  # rounded, for display only
             spi = _ratio(ev, pv) if pv else None
-            eac = round(bac / cpi, 2) if cpi else (round(ac, 2) if pr >= 100 else None)
+            # EAC = BAC / CPI = BAC x AC / EV, from the unrounded numbers.
+            eac = round(bac * ac / ev, 2) if ac and ev else (round(ac, 2) if pr >= 100 else None)
             row.update({
                 "ev": ev, "pv": pv, "cv": round(ev - ac, 2), "sv": round(ev - pv, 2) if pv is not None else None, "cpi": cpi, "spi": spi,
                 "eac": eac, "vac": round(bac - eac, 2) if eac is not None else None,
@@ -365,12 +406,25 @@ def variance(db, principal, project_id=None) -> dict:
     ev_sum = sum(r["ev"] for r in with_budget)
     ac_sum = sum(r["actual"] for r in with_budget)
     pv_sum = sum(r["pv"] or 0 for r in with_budget)
+    # Each portfolio figure compares one set of projects: CPI only over projects that have a cost (EV of work with
+    # no cost recorded would inflate it), SPI only over projects with dates, and the forecast over every budgeted
+    # project (no forecast yet: the budget, or cost so far + the work left once there is cost but no progress).
+    costed = [r for r in with_budget if r["actual"]]
+    ev_costed, ac_costed = sum(r["ev"] for r in costed), sum(r["actual"] for r in costed)
+    dated = [r for r in with_budget if r["pv"] is not None]
+    ev_dated, pv_dated = sum(r["ev"] for r in dated), sum(r["pv"] for r in dated)
+
+    def forecast(r):
+        if r["eac"] is not None:
+            return r["eac"]
+        return r["actual"] + r["budget"] - r["ev"] if r["actual"] else r["budget"]
+
     return {
         "projects": rows,
         "summary": {
             "budget": round(sum(r["budget"] for r in with_budget), 2), "ev": round(ev_sum, 2), "ac": round(ac_sum, 2), "pv": round(pv_sum, 2),
-            "cpi": _ratio(ev_sum, ac_sum) if ac_sum else None, "spi": _ratio(ev_sum, pv_sum) if pv_sum else None,
-            "eac": round(sum(r["eac"] for r in with_budget if r["eac"] is not None), 2),
+            "cpi": _ratio(ev_costed, ac_costed) if ac_costed else None, "spi": _ratio(ev_dated, pv_dated) if pv_dated else None,
+            "eac": round(sum(forecast(r) for r in with_budget), 2),
             "over_budget": sum(1 for r in rows if r["cost_state"] in ("Over budget", "Slightly over")),
             "behind": sum(1 for r in rows if r["schedule_state"] in ("Behind", "Slightly behind")),
         },

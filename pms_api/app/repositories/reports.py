@@ -7,6 +7,7 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
+from app.core.access import visible_project_ids
 from app.models.billing import Invoice
 from app.models.projects import Project
 from app.models.risks import Issue, Risk, risk_level
@@ -15,6 +16,7 @@ from app.models.team import ProjectMember
 from app.models.timesheets import TimeEntry
 from app.repositories import dashboard as dashboard_repo
 from app.repositories import projects as project_repo
+from app.repositories.search import ESC, escape_like
 from app.repositories import team as team_repo
 from app.repositories import timesheets as timesheet_repo
 from app.repositories import work_calendar
@@ -51,12 +53,13 @@ def project_status(db: Session, principal, project_id=None, **_):
     today = date.today()
     projects = _projects(db, principal, project_id)
     progress = project_repo.progress_for(db, [p.id for p in projects])
+    budgets = timesheet_repo.project_budgets(db, principal, projects, progress, with_revenue=True)
     rows = []
     for p in projects:
         tasks = db.query(Task.status, Task.due_date).filter(Task.project_id == p.id, Task.is_deleted == False).all()  # noqa: E712
         pr = progress.get(p.id, {}).get("progress", 0)
         overdue = sum(1 for s, d in tasks if d and d < today and s != "Done")
-        b = timesheet_repo.project_budget(db, principal, p, pr)
+        b = budgets[p.id]
         high = sum(1 for r in db.query(Risk).filter(Risk.project_id == p.id, Risk.is_deleted == False, Risk.status.in_(("Open", "Monitoring")))  # noqa: E712
                    if risk_level(r.probability * r.impact) == "High")
         health, reason = dashboard_repo._health(p, pr, overdue, b["health"], today, high)
@@ -95,7 +98,7 @@ def timesheet_hours(db: Session, principal, project_id=None, date_from=None, dat
                 TimeEntry.project_id.in_(ids), TimeEntry.work_date >= start, TimeEntry.work_date <= end)
     )
     if person:
-        query = query.filter(TimeEntry.member_name.ilike(f"%{person}%"))
+        query = query.filter(TimeEntry.member_name.ilike(f"%{escape_like(person)}%", escape=ESC))
     groups = {}
     for e, code, name, rate in query:
         g = groups.setdefault((e.member_name, code), {"person": e.member_name, "code": code, "project": name, "approved": 0.0, "submitted": 0.0, "draft": 0.0, "rejected": 0.0, "cost": 0.0})
@@ -129,9 +132,10 @@ def timesheet_hours(db: Session, principal, project_id=None, date_from=None, dat
 def budget_vs_actual(db: Session, principal, project_id=None, **_):
     projects = _projects(db, principal, project_id)
     progress = project_repo.progress_for(db, [p.id for p in projects])
+    budgets = timesheet_repo.project_budgets(db, principal, projects, progress, with_revenue=True)
     rows = []
     for p in projects:
-        b = timesheet_repo.project_budget(db, principal, p, progress.get(p.id, {}).get("progress", 0))
+        b = budgets[p.id]
         rows.append({"code": p.project_code, "project": p.project_name, "status": p.status, "budget": b["budget"], "actual": b["actual_cost"],
                      "pending": b["pending_cost"], "remaining": b["remaining"], "used_pct": b["used_pct"], "forecast": b["forecast"],
                      "billed": b["billed"], "collected": b["collected"], "margin": b["margin"], "health": b["health"]})
@@ -175,18 +179,22 @@ def billing(db: Session, principal, project_id=None, date_from=None, date_to=Non
                      "subtotal": float(inv.subtotal), "tax": float(inv.tax_amount), "total": float(inv.total), "days_overdue": late})
     live = [r for r in rows if r["status"] != "Cancelled"]
     totals = {"subtotal": round(sum(r["subtotal"] for r in live), 2), "tax": round(sum(r["tax"] for r in live), 2), "total": round(sum(r["total"] for r in live), 2)}
+    # Drafts are not sent yet, so "Invoiced" counts only Issued and Paid (= Collected + Outstanding).
+    sent = [r for r in live if r["status"] in ("Issued", "Paid")]
     return {
         "title": "Billing & Collections",
-        "description": f"Invoices issued (or drafted) {start.strftime('%d %b %Y')} to {end.strftime('%d %b %Y')}. Cancelled invoices are listed but not totalled.",
+        "description": f"Invoices issued (or drafted) {start.strftime('%d %b %Y')} to {end.strftime('%d %b %Y')}. "
+                       "Invoiced = Issued + Paid; drafts are shown on their own. Table totals include drafts; cancelled invoices are listed but not totalled.",
         "columns": [_col("invoice_no", "Invoice"), _col("code", "Project"), _col("client", "Client"), _col("type", "Type"), _col("status", "Status", "chip"),
                     _col("issue_date", "Issued", "date"), _col("due_date", "Due", "date"), _col("paid_date", "Paid", "date"), _col("subtotal", "Subtotal", "money"),
                     _col("tax", "GST", "money"), _col("total", "Total", "money"), _col("days_overdue", "Days Overdue", "number")],
         "rows": rows,
         "totals": totals,
         "summary": [
-            {"label": "Invoiced", "value": totals["total"], "type": "money"},
+            {"label": "Invoiced", "value": round(sum(r["total"] for r in sent), 2), "type": "money"},
             {"label": "Collected", "value": round(sum(r["total"] for r in live if r["status"] == "Paid"), 2), "type": "money"},
             {"label": "Outstanding", "value": round(sum(r["total"] for r in live if r["status"] == "Issued"), 2), "type": "money"},
+            {"label": "Draft (not sent)", "value": round(sum(r["total"] for r in live if r["status"] == "Draft"), 2), "type": "money"},
             {"label": "Overdue Invoices", "value": sum(1 for r in live if r["days_overdue"]), "type": "number"},
         ],
         "chart": {"x": "invoice_no", "series": [{"key": "total", "label": "Total"}]},
@@ -234,12 +242,17 @@ def utilization(db: Session, principal, date_from=None, date_to=None, person=Non
     cal = work_calendar.for_client(db, principal.client_id)
     days = cal.count(start, end)
     HOURS_PER_DAY = cal.hours_per_day  # noqa: N806
-    people = team_repo.allocation_overview(db, principal, search=person)
+    people = team_repo.allocation_overview(db, principal)
+    if person:
+        # "Person" filters on the person's name only (not their role or project names).
+        people = [p for p in people if person.lower() in p["member_name"].lower()]
     hours = defaultdict(float)
+    # Hours on deleted projects, and on projects this login cannot see, are not counted.
     entries = (
         db.query(TimeEntry.user_id, TimeEntry.member_name, TimeEntry.hours)
-        .join(Task, Task.id == TimeEntry.task_id)
-        .filter(TimeEntry.client_id == principal.client_id, TimeEntry.is_deleted == False, Task.is_deleted == False,  # noqa: E712
+        .join(Task, Task.id == TimeEntry.task_id).join(Project, Project.id == TimeEntry.project_id)
+        .filter(TimeEntry.client_id == principal.client_id, TimeEntry.is_deleted == False, Task.is_deleted == False, Project.is_deleted == False,  # noqa: E712
+                TimeEntry.project_id.in_(visible_project_ids(db, principal)),
                 TimeEntry.status == "Approved", TimeEntry.work_date >= start, TimeEntry.work_date <= end)
     )
     for uid, name, h in entries:
@@ -278,7 +291,7 @@ def overdue_tasks(db: Session, principal, project_id=None, person=None, **_):
     codes = dict(db.query(Project.id, Project.project_code).filter(Project.id.in_(ids)).all())
     query = db.query(Task).filter(Task.project_id.in_(ids), Task.is_deleted == False, Task.due_date != None, Task.due_date < today, Task.status != "Done")  # noqa: E711,E712
     if person:
-        query = query.filter(Task.assignee_name.ilike(f"%{person}%"))
+        query = query.filter(Task.assignee_name.ilike(f"%{escape_like(person)}%", escape=ESC))
     rows = [{"key": t.task_key, "code": codes.get(t.project_id), "title": t.title, "assignee": t.assignee_name or "Unassigned", "priority": t.priority,
              "status": t.status, "due": t.due_date, "days_late": (today - t.due_date).days} for t in query]
     rows.sort(key=lambda r: -r["days_late"])

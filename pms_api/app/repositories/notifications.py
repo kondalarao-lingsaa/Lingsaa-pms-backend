@@ -9,10 +9,11 @@
 Nobody is notified about their own action. Rows are added to the caller's session; the caller commits."""
 import re
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, false, func, or_
 from sqlalchemy.orm import Session
 
-from app.core import mailer
+from app.core import mailer, roles
+from app.core.access import visible_project_ids
 from app.models.notifications import Notification
 from app.models.tasks import Task, TaskWatcher
 from app.models.team import ProjectMember
@@ -38,8 +39,9 @@ def _is_actor(principal, user_id, name) -> bool:
     return _same(name, principal.user_name) or _same(name, person_name(principal.user_name))
 
 
-def notify(db: Session, principal, recipients, kind, title, body=None, link=None, project_id=None, task_id=None, comment_id=None) -> int:
-    """recipients: iterable of (user_id, name). Duplicates and the actor are skipped. Returns how many were added."""
+def notify(db: Session, principal, recipients, kind, title, body=None, link=None, project_id=None, task_id=None, comment_id=None, email_body=None) -> int:
+    """recipients: iterable of (user_id, name). Duplicates and the actor are skipped. Returns how many were added.
+    email_body: a longer text for the email than the bell shows (the weekly report), else the email repeats body."""
     seen, added, emails = set(), 0, []
     for user_id, name in recipients:
         if not user_id and not name:
@@ -55,7 +57,7 @@ def notify(db: Session, principal, recipients, kind, title, body=None, link=None
         ))
         added += 1
         if user_id and kind in mailer.alert_kinds():
-            emails.append((user_id, title, body, link))
+            emails.append((user_id, title, email_body or body, link))
     _email(db, principal, emails)
     return added
 
@@ -112,8 +114,19 @@ def _my_names(db: Session, principal) -> list:
 
 
 def mine(db: Session, principal):
-    by_name = and_(Notification.recipient_user_id == None, func.lower(Notification.recipient_name).in_(_my_names(db, principal) or ["-"]))  # noqa: E711
-    who = or_(Notification.recipient_user_id == principal.user_id, by_name) if principal.user_id else by_name
+    # Rows for team members typed in by name only (no login linked) reach a login with the same name - but never a
+    # client login, and only for projects this login may see, so internal task chatter cannot leak by a shared name.
+    by_name = None
+    if getattr(principal, "role_key", None) != roles.CLIENT:
+        by_name = and_(
+            Notification.recipient_user_id == None,  # noqa: E711
+            func.lower(Notification.recipient_name).in_(_my_names(db, principal) or ["-"]),
+            or_(Notification.project_id == None, Notification.project_id.in_(visible_project_ids(db, principal))),  # noqa: E711
+        )
+    if principal.user_id:
+        who = or_(Notification.recipient_user_id == principal.user_id, by_name) if by_name is not None else Notification.recipient_user_id == principal.user_id
+    else:
+        who = by_name if by_name is not None else false()
     return db.query(Notification).filter(Notification.client_id == principal.client_id, who)
 
 

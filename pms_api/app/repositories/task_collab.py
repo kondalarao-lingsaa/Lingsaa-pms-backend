@@ -1,5 +1,6 @@
 """Task Details features: comments, dependencies, watchers and history. Every function receives a
 task that was already loaded through repositories.tasks.get_task, so it belongs to the caller's company."""
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models.tasks import Task, TaskActivity, TaskComment, TaskDependency, TaskWatcher
@@ -127,6 +128,12 @@ def add_dependency(db: Session, principal, task: Task, depends_on_id: int) -> No
         raise CollabError("The task you picked was not found")
     if other.project_id != task.project_id:
         raise CollabError("Dependencies can only link tasks of the same project")
+    # Held until commit: two links added at the same moment are checked one after the other, so they cannot
+    # close a loop between them (A waits for B while B waits for A).
+    db.execute(
+        text("EXEC sp_getapplock @Resource = :r, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 15000"),
+        {"r": f"pms_deps_{task.project_id}"},
+    )
     exists = db.query(TaskDependency).filter(TaskDependency.task_id == task.id, TaskDependency.depends_on_id == other.id).first()
     if exists:
         raise CollabError(f"{task.task_key} already depends on {other.task_key}")
@@ -139,6 +146,10 @@ def add_dependency(db: Session, principal, task: Task, depends_on_id: int) -> No
 
 
 def remove_dependency(db: Session, principal, task: Task, dependency_id: int) -> None:
+    try:
+        task_repo._ensure_open(db, task.project_id)
+    except task_repo.TaskError as exc:
+        raise CollabError(str(exc)) from exc
     dep = (
         db.query(TaskDependency)
         .filter(TaskDependency.id == dependency_id)

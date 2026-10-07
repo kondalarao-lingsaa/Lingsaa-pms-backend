@@ -141,8 +141,8 @@ try:
     call("POST", f"/tasks/{t2['id']}/status", {"status": "Done"})
     s, r = call("GET", f"/projects/{pid}/milestones")
     m_now = next(m for m in r["detail"] if m["id"] == ms["id"])
-    ok("milestone started itself when work began and shows 2/2 tasks done", m_now["status"] == "In Progress" and m_now["tasks_done"] == 2, m_now)
-    call("POST", f"/projects/{pid}/milestones/{ms['id']}/status", {"status": "Ready for Review"})
+    # Settings > Automation: with all its work done the milestone goes to Ready for Review by itself.
+    ok("milestone shows 2/2 tasks done and went to Ready for Review by itself", m_now["status"] == "Ready for Review" and m_now["tasks_done"] == 2, m_now)
     s, r = call("POST", f"/projects/{pid}/milestones/{ms['id']}/status", {"status": "Accepted"}, token=MGR)
     ok("milestone Accepted", s == 200 and r["data"]["status"] == "Accepted", r)
 
@@ -153,9 +153,10 @@ try:
     ok("velocity = 16 estimated hours", r["stack_values"]["velocity"] and r["stack_values"]["velocity"][-1]["completed"] == 16, r["stack_values"])
 
     step("Billing: milestone invoice + Time & Material (hours + billable expense), issue, pay one")
-    s, r = call("POST", "/billing/invoices", {"project_id": pid, "invoice_type": "Milestone", "milestone_id": ms["id"]})
-    inv_m = r["data"]
-    ok("milestone invoice uses the project default GST 18% -> ₹47,200", s == 201 and inv_m["total"] == 47200, r)
+    # Settings > Automation: accepting the milestone drafted its invoice.
+    s, r = call("GET", f"/billing/invoices?project_id={pid}&page_size=50")
+    inv_m = next((i for i in r.get("detail") or [] if i["invoice_type"] == "Milestone"), None)
+    ok("milestone invoice drafted on acceptance, project default GST 18% -> ₹47,200", inv_m is not None and inv_m["status"] == "Draft" and inv_m["total"] == 47200, r)
     s, r = call("POST", "/billing/invoices", {"project_id": pid, "invoice_type": "Time & Material", "period_from": d(-14), "period_to": d(0)})
     inv_t = r["data"]
     ok("T&M invoice = 8 h x ₹1000 + ₹2,000 cab = ₹10,000 + GST", s == 201 and inv_t["subtotal"] == 10000, r)

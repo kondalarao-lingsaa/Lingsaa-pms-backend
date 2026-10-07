@@ -47,6 +47,7 @@ ADDED_COLUMNS = [
     ("projectmanagement.milestones", "baseline_due_date", "DATE"),
     ("projectmanagement.user_roles", "password_hash", "NVARCHAR(200)"),
     ("projectmanagement.user_roles", "last_login_at", "DATETIME"),
+    ("projectmanagement.project_members", "bill_rate", "DECIMAL(10,2)"),
 ]
 
 # Columns widened after they were created.
@@ -158,6 +159,62 @@ with engine.begin() as conn:
     for name, (table, sql) in INDEXES.items():
         conn.execute(text(f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{name}' AND object_id = OBJECT_ID('{table}')) {sql}"))
         print(f"ok: index {name}")
+
+# Unique rules that rows saved before them may already break (two clicks or two people at the same moment).
+# Each index is created only when no such rows exist; otherwise the rows are listed to be fixed by hand (rename,
+# complete or remove the extra one) and the next run creates the index. Nothing is changed automatically.
+# name -> (table, CREATE statement, query listing the rows that break the rule)
+GUARDED_INDEXES = {
+    # One live project / template name per company (the collation ignores case, like the app's own check).
+    "ux_projects_client_name": (
+        "projectmanagement.projects",
+        "CREATE UNIQUE INDEX ux_projects_client_name ON projectmanagement.projects (client_id, project_name) WHERE is_deleted = 0",
+        "SELECT client_id, project_name, COUNT(*) FROM projectmanagement.projects WHERE is_deleted = 0 GROUP BY client_id, project_name HAVING COUNT(*) > 1",
+    ),
+    "ux_project_templates_client_name": (
+        "projectmanagement.project_templates",
+        "CREATE UNIQUE INDEX ux_project_templates_client_name ON projectmanagement.project_templates (client_id, name) WHERE is_deleted = 0",
+        "SELECT client_id, name, COUNT(*) FROM projectmanagement.project_templates WHERE is_deleted = 0 GROUP BY client_id, name HAVING COUNT(*) > 1",
+    ),
+    # At most one Active sprint per project.
+    "ux_sprints_one_active": (
+        "projectmanagement.sprints",
+        "CREATE UNIQUE INDEX ux_sprints_one_active ON projectmanagement.sprints (project_id) WHERE status = 'Active' AND is_deleted = 0",
+        "SELECT project_id, COUNT(*) FROM projectmanagement.sprints WHERE status = 'Active' AND is_deleted = 0 GROUP BY project_id HAVING COUNT(*) > 1",
+    ),
+    # A login is on a project's team once.
+    "ux_project_members_user": (
+        "projectmanagement.project_members",
+        "CREATE UNIQUE INDEX ux_project_members_user ON projectmanagement.project_members (project_id, user_id) WHERE is_deleted = 0 AND user_id IS NOT NULL",
+        "SELECT project_id, user_id, COUNT(*) FROM projectmanagement.project_members WHERE is_deleted = 0 AND user_id IS NOT NULL "
+        "GROUP BY project_id, user_id HAVING COUNT(*) > 1",
+    ),
+    # One live latest version per document, and each live version number once (a deleted number is reused).
+    "ux_documents_latest": (
+        "projectmanagement.documents",
+        "CREATE UNIQUE INDEX ux_documents_latest ON projectmanagement.documents (group_key) WHERE is_latest = 1 AND is_deleted = 0",
+        "SELECT group_key, COUNT(*) FROM projectmanagement.documents WHERE is_latest = 1 AND is_deleted = 0 GROUP BY group_key HAVING COUNT(*) > 1",
+    ),
+    "ux_documents_group_version": (
+        "projectmanagement.documents",
+        "CREATE UNIQUE INDEX ux_documents_group_version ON projectmanagement.documents (group_key, version) WHERE is_deleted = 0",
+        "SELECT group_key, version, COUNT(*) FROM projectmanagement.documents WHERE is_deleted = 0 GROUP BY group_key, version HAVING COUNT(*) > 1",
+    ),
+}
+
+for name, (table, sql, duplicates) in GUARDED_INDEXES.items():
+    with engine.begin() as conn:
+        if conn.execute(text("SELECT 1 FROM sys.indexes WHERE name = :n AND object_id = OBJECT_ID(:t)"), {"n": name, "t": table}).first():
+            print(f"ok: index {name}")
+            continue
+        found = conn.execute(text(duplicates)).all()
+        if found:
+            print(f"SKIPPED: index {name} - {len(found)} group(s) of rows break it; fix them, then run this again:")
+            for row in found[:20]:
+                print("    " + ", ".join(str(v) for v in row))
+            continue
+        conn.execute(text(sql))
+        print(f"ok: index {name} (created)")
 
 # Team clean-up: exactly one "Project Manager" per project - the project's current manager (old managers left
 # behind by a manager change are removed, or kept as "Other" when they have tasks/hours). Soft changes only.

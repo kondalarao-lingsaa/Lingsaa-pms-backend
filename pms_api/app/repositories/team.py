@@ -4,7 +4,7 @@ A person is identified by their login user id when known, otherwise by name (cas
 person on two projects is recognised as one resource for the allocation rules and the Resources screens."""
 from datetime import date
 
-from sqlalchemy import case, func, or_
+from sqlalchemy import case, func, or_, text
 from sqlalchemy.orm import Session
 
 from app.models.projects import Project
@@ -13,6 +13,7 @@ from app.models.team import ProjectMember
 from app.models.timesheets import TimeEntry
 from app.schemas.team import member_out
 from app.core.access import project_scope
+from app.core.industries import PM_ROLE
 
 # Projects in these states no longer hold people's time.
 INACTIVE_PROJECT_STATUSES = ("Closed",)
@@ -22,11 +23,26 @@ class TeamError(Exception):
     """A team rule was broken; the message is safe to show to the user."""
 
 
-def _live_members(db: Session, principal):
+def _company_members(db: Session, principal):
+    """Every live team row of the company, whatever projects the caller can see: a person's time is one
+    budget, so the allocation rules always count all of it."""
     return (
         db.query(ProjectMember)
         .join(Project, Project.id == ProjectMember.project_id)
-        .filter(ProjectMember.client_id == principal.client_id, ProjectMember.is_deleted == False, Project.is_deleted == False, project_scope(db, principal))  # noqa: E712
+        .filter(ProjectMember.client_id == principal.client_id, ProjectMember.is_deleted == False, Project.is_deleted == False)  # noqa: E712
+    )
+
+
+def _live_members(db: Session, principal):
+    return _company_members(db, principal).filter(project_scope(db, principal))
+
+
+def _lock_team(db, principal) -> None:
+    """Holds the company's team lock until commit, so two people adding or changing members at the same
+    moment are checked one after the other (no duplicate rows, nobody booked over 100%)."""
+    db.execute(
+        text("EXEC sp_getapplock @Resource = :r, @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 15000"),
+        {"r": f"pms_team_{principal.client_id}"},
     )
 
 
@@ -71,26 +87,32 @@ def list_members(db, principal, project_id) -> list:
 
 
 def _other_allocations(db, principal, user_id, name, exclude_member_id=None):
-    """The person's time already promised to other active projects: [(project_code, pct), ...]."""
+    """The person's time already promised to other active projects, company-wide: [(project_id, project_code, pct), ...]."""
     query = (
-        _live_members(db, principal)
+        _company_members(db, principal)
         .filter(_same_person(user_id, name), Project.status.notin_(INACTIVE_PROJECT_STATUSES))
-        .with_entities(Project.project_code, ProjectMember.allocation_pct, ProjectMember.id)
+        .with_entities(Project.id, Project.project_code, ProjectMember.allocation_pct, ProjectMember.id)
     )
-    return [(code, pct) for code, pct, mid in query if mid != exclude_member_id]
+    return [(pid, code, pct) for pid, code, pct, mid in query if mid != exclude_member_id]
 
 
 def _check_allocation(db, principal, data, exclude_member_id=None):
     others = _other_allocations(db, principal, data.get("user_id"), data["member_name"], exclude_member_id)
-    used = sum(pct for _, pct in others)
+    used = sum(pct for _, _, pct in others)
     if used + data["allocation_pct"] > 100:
         free = max(0, 100 - used)
-        detail = ", ".join(f"{code} {pct}%" for code, pct in others)
-        raise TeamError(f"{data['member_name']} is already {used}% allocated ({detail}). At most {free}% is free.")
+        # Projects the caller cannot see are summed up without their codes.
+        ids = {pid for pid, _, _ in others}
+        visible = {pid for (pid,) in db.query(Project.id).filter(Project.id.in_(ids), project_scope(db, principal))} if ids else set()
+        parts = [f"{code} {pct}%" for pid, code, pct in others if pid in visible]
+        hidden = sum(pct for pid, _, pct in others if pid not in visible)
+        if hidden:
+            parts.append(f"{hidden}% on other projects")
+        raise TeamError(f"{data['member_name']} is already {used}% allocated ({', '.join(parts)}). At most {free}% is free.")
 
 
 def _check_duplicate(db, principal, project_id, data, exclude_member_id=None):
-    query = _live_members(db, principal).filter(ProjectMember.project_id == project_id, _same_person(data.get("user_id"), data["member_name"]))
+    query = _company_members(db, principal).filter(ProjectMember.project_id == project_id, _same_person(data.get("user_id"), data["member_name"]))
     if exclude_member_id:
         query = query.filter(ProjectMember.id != exclude_member_id)
     if query.first():
@@ -113,8 +135,58 @@ def _check_role(db, principal, role, current=None):
         raise TeamError(f"'{role}' is not one of your company's team roles. Add it in Settings > Industry & Roles first")
 
 
+def company_people(db, principal) -> list:
+    """Internal login users of the company (never Client users) - the people a team member can be linked to."""
+    from app.models.access import UserRole
+
+    rows = (
+        db.query(UserRole)
+        .filter(UserRole.client_id == principal.client_id, UserRole.is_active == True, UserRole.role != "client")  # noqa: E712
+        .order_by(UserRole.user_name)
+        .all()
+    )
+    return [{"user_id": r.user_id, "name": r.user_name, "email": r.email, "role": r.role} for r in rows]
+
+
+def _link_login(db, principal, data: dict) -> None:
+    """Ties the member to their login user, which is what lets them log hours, see the project and (as Team Lead)
+    approve the team's hours. Picked from the list = user_id sent; otherwise matched by email, then by exact name.
+    A linked member always carries the login's own name and email."""
+    people = company_people(db, principal)
+    person = None
+    if data.get("user_id"):
+        person = next((p for p in people if p["user_id"] == data["user_id"]), None)
+        if person is None:
+            raise TeamError("That person is not an active user of your company. Pick them from the list")
+    if person is None and data.get("email"):
+        person = next((p for p in people if (p["email"] or "").lower() == data["email"].strip().lower()), None)
+    if person is None:
+        same_name = [p for p in people if p["name"].strip().lower() == data["member_name"].strip().lower()]
+        person = same_name[0] if len(same_name) == 1 else None
+    if person is not None:
+        data["user_id"], data["member_name"] = person["user_id"], person["name"]
+        data["email"] = person["email"] or data.get("email")
+
+
+def _check_manager_role(project, data, current=None):
+    """"Project Manager" belongs to the project's own manager (set on the project); anyone else given it would
+    silently become "Other" on the next project save."""
+    if data["role"] != PM_ROLE or current == PM_ROLE:
+        return
+    name = (project.project_manager_name or "").strip().lower()
+    is_manager = bool(project.project_manager_id and data.get("user_id") == project.project_manager_id) or (
+        bool(name) and data["member_name"].strip().lower() == name
+    )
+    if not is_manager:
+        who = project.project_manager_name or "nobody yet"
+        raise TeamError(f"'{PM_ROLE}' is the project's manager ({who}). Change the manager on the project itself, or pick another role")
+
+
 def create_member(db, principal, project, data: dict) -> ProjectMember:
+    _link_login(db, principal, data)
     _check_role(db, principal, data["role"])
+    _check_manager_role(project, data)
+    _lock_team(db, principal)
     _check_duplicate(db, principal, project.id, data)
     _check_dates(project, data)
     _check_allocation(db, principal, data)
@@ -126,7 +198,10 @@ def create_member(db, principal, project, data: dict) -> ProjectMember:
 
 
 def update_member(db, principal, project, member: ProjectMember, data: dict) -> ProjectMember:
+    _link_login(db, principal, data)
     _check_role(db, principal, data["role"], current=member.role)
+    _check_manager_role(project, data, current=member.role)
+    _lock_team(db, principal)
     _check_duplicate(db, principal, project.id, data, exclude_member_id=member.id)
     _check_dates(project, data)
     _check_allocation(db, principal, data, exclude_member_id=member.id)
@@ -188,7 +263,8 @@ def ensure_manager_member(db, principal, project, commit=True) -> None:
         if current.role != "Project Manager":
             current.role = "Project Manager"
             current.updated_by = principal.user_id
-        if project.project_manager_id and not current.user_id:
+        # Linked to the manager's login - unless another live member row already carries it (one row per login).
+        if project.project_manager_id and not current.user_id and not any(m.user_id == project.project_manager_id for m in members):
             current.user_id = project.project_manager_id
     else:
         db.add(
@@ -214,7 +290,8 @@ def resolve_assignee(db, principal, project_id, name, user_id):
     member = _live_members(db, principal).filter(ProjectMember.project_id == project_id, _same_person(user_id, name)).first()
     if member is None:
         raise TeamError(f"{name or 'This person'} is not in this project's team. Add them in Project Details > Team first.")
-    return member.user_id or user_id, member.member_name
+    # The member's own login only: a member typed in by name (no login) never borrows the caller's user id.
+    return member.user_id, member.member_name
 
 
 def member_project_ids(db, principal, user_id) -> list:
@@ -225,17 +302,28 @@ def member_project_ids(db, principal, user_id) -> list:
 
 
 def allocation_overview(db, principal, search=None, over_only=False) -> list:
-    """Every person across the company's active projects, with their total allocation and workload."""
-    query = _live_members(db, principal).filter(Project.status.notin_(INACTIVE_PROJECT_STATUSES))
+    """Every person across the company's active projects, with their total allocation and workload.
+
+    The search picks people (by name, or a role / project of theirs); each picked person's totals still count
+    all their active projects. Totals also count projects the caller cannot see (shown as other_allocation)."""
+
+    def key_of(m):
+        return f"u{m.user_id}" if m.user_id else f"n{m.member_name.lower()}"
+
+    active = Project.status.notin_(INACTIVE_PROJECT_STATUSES)
+    rows = _live_members(db, principal).filter(active).with_entities(ProjectMember, Project.project_code, Project.project_name, Project.status).order_by(ProjectMember.member_name).all()
     if search:
-        like = f"%{search}%"
-        query = query.filter(or_(ProjectMember.member_name.ilike(like), ProjectMember.role.ilike(like), Project.project_name.ilike(like)))
-    rows = query.with_entities(ProjectMember, Project.project_code, Project.project_name, Project.status).order_by(ProjectMember.member_name).all()
+        needle = search.strip().lower()
+        matched = {key_of(m) for m, code, name, status in rows if any(needle in (v or "").lower() for v in (m.member_name, m.role, name))}
+        rows = [row for row in rows if key_of(row[0]) in matched]
+    company_total = {}
+    for m in _company_members(db, principal).filter(active).with_entities(ProjectMember.user_id, ProjectMember.member_name, ProjectMember.allocation_pct):
+        company_total[key_of(m)] = company_total.get(key_of(m), 0) + m.allocation_pct
 
     stats = _task_stats(db, [row[0] for row in rows])
     people = {}
     for m, code, name, status in rows:
-        key = f"u{m.user_id}" if m.user_id else f"n{m.member_name.lower()}"
+        key = key_of(m)
         person = people.setdefault(
             key,
             {"key": key, "user_id": m.user_id, "member_name": m.member_name, "email": m.email, "total_allocation": 0,
@@ -253,6 +341,10 @@ def allocation_overview(db, principal, search=None, over_only=False) -> list:
             {"member_id": m.id, "project_id": m.project_id, "project_code": code, "project_name": name, "project_status": status,
              "role": m.role, "allocation_pct": m.allocation_pct, "open_tasks": s.get("open", 0)}
         )
+    for key, p in people.items():
+        # Time on projects the caller cannot see still counts towards the person's load.
+        p["other_allocation"] = max(0, company_total.get(key, 0) - p["total_allocation"])
+        p["total_allocation"] += p["other_allocation"]
     result = sorted(people.values(), key=lambda p: (-p["total_allocation"], p["member_name"].lower()))
     for p in result:
         p["free_allocation"] = max(0, 100 - p["total_allocation"])

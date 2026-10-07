@@ -17,6 +17,9 @@ PROJECT_TRANSITIONS = {
 }
 
 
+PROJECT_TYPES = ["Fixed Price", "Time & Material", "Retainer", "Internal"]
+
+
 class Project(Base):
     __tablename__ = "projects"
     __table_args__ = (

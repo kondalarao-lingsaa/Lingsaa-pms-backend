@@ -4,11 +4,12 @@ import re
 import uuid
 from pathlib import Path
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.documents import DOCUMENT_CATEGORIES, Document
+from app.models.expenses import EDITABLE_EXPENSE_STATUSES, Expense
 from app.models.milestones import Deliverable, Milestone
 from app.models.projects import Project
 from app.models.tasks import Task
@@ -22,7 +23,7 @@ ALLOWED = {
     "jpg": ("image/jpeg", [b"\xff\xd8\xff"]),
     "jpeg": ("image/jpeg", [b"\xff\xd8\xff"]),
     "gif": ("image/gif", [b"GIF87a", b"GIF89a"]),
-    "webp": ("image/webp", [b"RIFF"]),
+    "webp": ("image/webp", [b"RIFF"]),  # plus "WEBP" at byte 8, checked in check_file
     "docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", [b"PK\x03\x04"]),
     "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", [b"PK\x03\x04"]),
     "pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation", [b"PK\x03\x04"]),
@@ -73,12 +74,16 @@ def check_file(file_name: str, data: bytes) -> tuple:
         raise FileRejected("The file is empty")
     limit = settings.MAX_UPLOAD_MB * 1024 * 1024
     if len(data) > limit:
-        raise FileRejected(f"The file is {len(data) / 1024 / 1024:.1f} MB. The largest allowed is {settings.MAX_UPLOAD_MB} MB")
-    if data.startswith(EXECUTABLE_SIGNATURES):
-        raise FileRejected("This looks like a program or script, which cannot be uploaded")
+        # Only the first limit + 1 bytes are read, so the real size is not known here.
+        raise FileRejected(f"The file is larger than {settings.MAX_UPLOAD_MB} MB, the largest allowed")
     content_type, signatures = ALLOWED[ext]
+    # Text files are checked for null bytes below instead: plain text may well start with "MZ" or "#!".
+    if signatures and data.startswith(EXECUTABLE_SIGNATURES):
+        raise FileRejected("This looks like a program or script, which cannot be uploaded")
     if signatures and not any(data.startswith(sig) for sig in signatures):
         raise FileRejected(f"The file's content does not match '.{ext}'. It may be renamed or damaged")
+    if ext == "webp" and data[8:12] != b"WEBP":
+        raise FileRejected("The file's content does not match '.webp'. It may be renamed or damaged")
     if signatures is None and b"\x00" in data[:4096]:
         raise FileRejected(f"A '.{ext}' file must be plain text")
     return name, ext, content_type
@@ -92,6 +97,35 @@ def _live(db: Session, principal):
 
 def get_document(db, principal, document_id):
     return _live(db, principal).filter(Document.id == document_id).one_or_none()
+
+
+def latest_version_id(db, principal, document_id):
+    """The id of the newest live version of the document `document_id` belongs to (None if all are deleted)."""
+    doc = db.query(Document).filter(Document.id == document_id, Document.client_id == principal.client_id).one_or_none() if document_id else None
+    if doc is None:
+        return None
+    latest = _live(db, principal).filter(Document.group_key == doc.group_key, Document.is_latest == True).first()  # noqa: E712
+    return latest.id if latest else None
+
+
+def _lock_group(db, group_key):
+    """Holds every version of a document until commit, so two uploads or deletes of the same document at the same
+    moment run one after the other (otherwise both would add "version 2" and both would be the latest)."""
+    db.execute(text(f"SELECT id FROM {Document.__table__.fullname} WITH (UPDLOCK, HOLDLOCK) WHERE group_key = :g"), {"g": group_key})
+
+
+def _receipt_of(db, doc_ids) -> list:
+    """Expenses whose bill is one of these document rows. Checked again in Python: the session does not autoflush,
+    so an expense whose receipt was just cleared in this request must not count."""
+    rows = db.query(Expense).filter(Expense.receipt_document_id.in_(doc_ids), Expense.is_deleted == False).all()  # noqa: E712
+    return [e for e in rows if e.receipt_document_id in doc_ids]
+
+
+def _check_receipt_kept(expenses, action):
+    """The bill of an expense that was sent for approval (or decided) stays on record, like the expense itself."""
+    for e in expenses:
+        if e.status not in EDITABLE_EXPENSE_STATUSES:
+            raise DocumentError(f"This is the receipt of expense {e.expense_key} ({e.status}), so it stays on record and cannot be {action}")
 
 
 def _check_links(db, project, task_id, milestone_id, deliverable_id):
@@ -117,14 +151,21 @@ def save_upload(db, principal, project, *, file_name, data, title, category, not
         raise DocumentError("Please Select Category")
     name, ext, content_type = check_file(file_name, data)
 
-    group_key, version, previous = str(uuid.uuid4()), 1, None
+    group_key, version, previous, receipt_of = str(uuid.uuid4()), 1, None, []
     if replaces_id:
         previous = get_document(db, principal, replaces_id)
         if previous is None or previous.project_id != project.id:
             raise DocumentError("The document to replace was not found in this project")
+        _lock_group(db, previous.group_key)
+        db.refresh(previous)  # re-read under the lock: someone may have added a version a moment ago
+        if previous.is_deleted:
+            raise DocumentError("The document to replace was not found in this project")
         if not previous.is_latest:
             raise DocumentError("Upload the new version on top of the latest one")
         group_key, version = previous.group_key, previous.version + 1
+        group_ids = [row[0] for row in db.query(Document.id).filter(Document.group_key == group_key).all()]
+        receipt_of = _receipt_of(db, group_ids)
+        _check_receipt_kept(receipt_of, "replaced")
         # A new version keeps the document's place (links) unless new ones are given.
         task_id, milestone_id, deliverable_id = task_id or previous.task_id, milestone_id or previous.milestone_id, deliverable_id or previous.deliverable_id
     milestone_id = _check_links(db, project, task_id, milestone_id, deliverable_id)
@@ -140,6 +181,7 @@ def save_upload(db, principal, project, *, file_name, data, title, category, not
     try:
         if previous is not None:
             previous.is_latest = False
+            db.flush()  # before the new latest row is added (one live latest version per document)
         doc = Document(
             client_id=principal.client_id, project_id=project.id, task_id=task_id, milestone_id=milestone_id, deliverable_id=deliverable_id,
             group_key=group_key, version=version, is_latest=True, title=title[:1].upper() + title[1:200], category=category,
@@ -148,6 +190,10 @@ def save_upload(db, principal, project, *, file_name, data, title, category, not
             client_visible=previous.client_visible if previous is not None else None,
         )
         db.add(doc)
+        if receipt_of:
+            db.flush()
+            for e in receipt_of:  # a draft expense's bill is the newest version
+                e.receipt_document_id = doc.id
         db.commit()
     except Exception:
         target.unlink(missing_ok=True)  # never leave an orphan file behind a failed save
@@ -184,17 +230,29 @@ def delete_document(db, principal, project, doc) -> None:
     """Deletes one version; if it was the latest, the previous version becomes the latest again."""
     if project.status == "Closed":
         raise DocumentError(f"{project.project_code} is Closed")
+    _lock_group(db, doc.group_key)
+    db.refresh(doc)
+    if doc.is_deleted:
+        raise DocumentError("This file was already deleted. Refresh the list")
+    receipt_of = _receipt_of(db, [doc.id])
+    _check_receipt_kept(receipt_of, "deleted")
     doc.is_deleted = True
+    previous = (
+        db.query(Document)
+        .filter(Document.group_key == doc.group_key, Document.is_deleted == False, Document.id != doc.id)  # noqa: E712
+        .order_by(Document.version.desc())
+        .first()
+    )
     if doc.is_latest:
         doc.is_latest = False
-        previous = (
-            db.query(Document)
-            .filter(Document.group_key == doc.group_key, Document.is_deleted == False, Document.id != doc.id)  # noqa: E712
-            .order_by(Document.version.desc())
-            .first()
-        )
+        # Saved first: the database allows one live latest version per document (ux_documents_latest), and rows are
+        # otherwise written in id order - the older version would become latest while this one still is.
+        db.flush()
         if previous is not None:
             previous.is_latest = True
+    # A draft expense falls back to the version before (or has no bill again), so a new one can be attached.
+    for e in receipt_of:
+        e.receipt_document_id = previous.id if previous is not None else None
     db.commit()
 
 
@@ -206,6 +264,7 @@ def _names(db, docs):
     return (
         lookup(Project, "project", [d.project_id for d in docs], Project.project_code),
         lookup(Project, "project", [d.project_id for d in docs], Project.project_name),
+        lookup(Project, "project", [d.project_id for d in docs], Project.status),
         lookup(Task, "task", [d.task_id for d in docs], Task.task_key),
         lookup(Task, "task", [d.task_id for d in docs], Task.title),
         lookup(Milestone, "milestone", [d.milestone_id for d in docs], Milestone.name),
@@ -214,12 +273,13 @@ def _names(db, docs):
 
 
 def serialize(db, docs) -> list:
-    codes, pnames, tkeys, ttitles, mnames, dnames = _names(db, docs)
+    codes, pnames, pstatuses, tkeys, ttitles, mnames, dnames = _names(db, docs)
     groups = {d.group_key for d in docs}
     counts = dict(db.query(Document.group_key, func.count()).filter(Document.group_key.in_(groups), Document.is_deleted == False).group_by(Document.group_key).all()) if groups else {}  # noqa: E712
     return [
         {
             "id": d.id, "project_id": d.project_id, "project_code": codes.get(d.project_id), "project_name": pnames.get(d.project_id),
+            "project_status": pstatuses.get(d.project_id),
             "task_id": d.task_id, "task_key": tkeys.get(d.task_id), "task_title": ttitles.get(d.task_id),
             "milestone_id": d.milestone_id, "milestone_name": mnames.get(d.milestone_id),
             "deliverable_id": d.deliverable_id, "deliverable_name": dnames.get(d.deliverable_id),

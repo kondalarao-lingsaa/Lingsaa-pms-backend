@@ -57,14 +57,16 @@ def all_milestones(
     db: Session = Depends(get_db),
     principal: Principal = Depends(get_current_principal),
 ):
-    rows = repo.list_all(db, principal, project_id=project_id, status=status, search=search)
+    # The summary cards count every status; only the rows follow the status chip (as on Billing).
+    everything = repo.list_all(db, principal, project_id=project_id, search=search)
+    rows = [r for r in everything if r["status"] == status] if status else everything
     return {
         "detail": rows,
         "stack_values": {
             "count_pg": len(rows),
-            "status_counts": {s: sum(1 for r in rows if r["status"] == s) for s in MILESTONE_STATUSES},
-            "overdue": sum(1 for r in rows if r["is_overdue"]),
-            "accepted_value": round(sum(r["amount"] or 0 for r in rows if r["status"] == "Accepted"), 2),
+            "status_counts": {s: sum(1 for r in everything if r["status"] == s) for s in MILESTONE_STATUSES},
+            "overdue": sum(1 for r in everything if r["is_overdue"]),
+            "accepted_value": round(sum(r["amount"] or 0 for r in everything if r["status"] == "Accepted"), 2),
         },
     }
 
@@ -103,10 +105,16 @@ def delete_milestone(project_id: int, milestone_id: int, db: Session = Depends(g
 def change_milestone_status(
     project_id: int, milestone_id: int, body: MilestoneStatusIn, db: Session = Depends(get_db), principal: Principal = Depends(get_current_principal)
 ):
-    milestone = _milestone(db, principal, project_id, milestone_id)
-    if body.status in ("Accepted", "Changes Requested"):
-        # Accepting is the client's decision (client portal); the project's manager, a Director or an Admin may record it for them.
+    # Each move is checked here, before the lookup (a missing right is a 403, not a 404): Accept / Request Changes
+    # need "approve" (a Director has no "edit"), every other move needs "edit".
+    deciding = body.status in ("Accepted", "Changes Requested")
+    if deciding:
         access.check(principal, "deliverables", "approve", what="accept milestones or ask for changes")
+    else:
+        access.check(principal, "deliverables", "edit", what="change a milestone's status")
+    milestone = _milestone(db, principal, project_id, milestone_id)
+    if deciding:
+        # Accepting is the client's decision (client portal); the project's manager, a Director or an Admin may record it for them.
         _rule(approvals.require_manager, db, principal, project_id, "accept this milestone")
     milestone = _rule(repo.change_status, db, principal, milestone, body.status, body.feedback)
     if body.status in ("Accepted", "Changes Requested"):

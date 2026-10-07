@@ -6,6 +6,7 @@ from app.models.notifications import Notification
 from app.models.projects import Project
 from app.models.tasks import Task, TaskActivity, TaskComment
 from app.repositories import notifications as notification_repo
+from app.repositories.search import ESC, escape_like
 from app.schemas.rules import utc_iso
 from app.core.access import project_scope
 
@@ -32,8 +33,9 @@ def comments(db: Session, principal, *, project_id=None, search=None, involving_
     if project_id:
         query = query.filter(Task.project_id == project_id)
     if search:
-        like = f"%{search}%"
-        query = query.filter(or_(TaskComment.body.ilike(like), Task.title.ilike(like), Task.task_key.ilike(like), TaskComment.author_name.ilike(like)))
+        like = f"%{escape_like(search)}%"
+        query = query.filter(or_(TaskComment.body.ilike(like, escape=ESC), Task.title.ilike(like, escape=ESC), Task.task_key.ilike(like, escape=ESC),
+                                 TaskComment.author_name.ilike(like, escape=ESC)))
     if involving_me:
         # Comments I wrote, on tasks assigned to me, or that mention me.
         mentioned_ids = [cid for (cid,) in notification_repo.mine(db, principal).filter(Notification.kind == "mention", Notification.comment_id != None).with_entities(Notification.comment_id)]  # noqa: E711
@@ -80,12 +82,16 @@ def activity(db: Session, principal, *, project_id=None, action=None, actor=None
     if project_id:
         query = query.filter(Task.project_id == project_id)
     if action:
-        query = query.filter(TaskActivity.action.in_(ACTION_GROUPS.get(action, [action])))
+        cond = TaskActivity.action.in_(ACTION_GROUPS.get(action, [action]))
+        if action == "status":
+            # A status changed in the Edit Task form is logged inside an "updated" row ("Status: To Do -> Done; ...").
+            cond = or_(cond, (TaskActivity.action == "updated") & TaskActivity.detail.like("%Status: %"))
+        query = query.filter(cond)
     if actor:
         query = query.filter(func.lower(TaskActivity.actor_name) == actor.lower())
     if search:
-        like = f"%{search}%"
-        query = query.filter(or_(TaskActivity.detail.ilike(like), Task.title.ilike(like), Task.task_key.ilike(like)))
+        like = f"%{escape_like(search)}%"
+        query = query.filter(or_(TaskActivity.detail.ilike(like, escape=ESC), Task.title.ilike(like, escape=ESC), Task.task_key.ilike(like, escape=ESC)))
     total = query.count()
     rows = query.order_by(TaskActivity.created_at.desc(), TaskActivity.id.desc()).offset(offset).limit(limit).all()
     return [
